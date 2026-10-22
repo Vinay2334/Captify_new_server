@@ -1,0 +1,25 @@
+[project]
+name = "captify-server"
+version = "0.1.0"
+description = "FastAPI WebSocket backend relaying tab audio to OpenAI Realtime transcription"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "websockets>=15",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "httpx>=0.27",
+    "anyio>=4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
