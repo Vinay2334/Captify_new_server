@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.websocket import build_upstream_client, router
+from app.api.webrtc import router as webrtc_router
 from app.core.config import Settings, settings as default_settings
 from app.core.logging import configure_logging, get_logger
 
@@ -24,6 +25,16 @@ async def lifespan(app: FastAPI):
         "reach it may consume OpenAI API quota; keep it on localhost"
     )
     yield
+    peers = list(getattr(app.state, "webrtc_peers", set()))
+    for pc in peers:
+        try:
+            await pc.close()
+        except Exception:
+            pass
+    tasks = list(getattr(app.state, "background_tasks", set()))
+    for task in tasks:
+        if not task.done():
+            task.cancel()
     log.info("shutdown complete")
 
 
@@ -34,8 +45,11 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     app.state.settings = resolved
     app.state.slot_lock = asyncio.Lock()
     app.state.active_sessions = 0
+    app.state.webrtc_peers = set()
+    app.state.background_tasks = set()
     app.state.upstream_factory = lambda: build_upstream_client(resolved)
     app.include_router(router)
+    app.include_router(webrtc_router)
 
     @app.get("/api/v1/health")
     async def health() -> dict:

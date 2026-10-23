@@ -45,6 +45,17 @@ class Settings(BaseSettings):
         default=96000, alias="MAX_AUDIO_BYTES_PER_SECOND"
     )
 
+    # WebRTC DataChannel audio (extensionRTC build). The label must match
+    # DATA_CHANNEL_LABEL in extensionRTC/rtc-config.js. The extension
+    # streams continuously without commits while the upstream session
+    # needs manual commits, so the server auto-commits while audio flows.
+    webrtc_data_channel_label: str = Field(
+        default="audio", alias="WEBRTC_DATA_CHANNEL_LABEL"
+    )
+    webrtc_auto_commit_seconds: float = Field(
+        default=5.0, alias="WEBRTC_AUTO_COMMIT_SECONDS"
+    )
+
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     @field_validator(
@@ -58,7 +69,7 @@ class Settings(BaseSettings):
             raise ValueError("must be positive")
         return value
 
-    @field_validator("session_idle_timeout_seconds")
+    @field_validator("session_idle_timeout_seconds", "webrtc_auto_commit_seconds")
     @classmethod
     def _positive_float(cls, value: float) -> float:
         if value <= 0:

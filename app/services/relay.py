@@ -257,6 +257,11 @@ class RelaySession:
                     "invalid_event", "unsupported or malformed event"
                 )
                 continue
+            except Exception as exc:
+                if str(exc) == "heartbeat":
+                    log.debug("client heartbeat received")
+                    continue
+                raise
 
             if isinstance(event, (AudioAppendEvent, UpstreamAudioAppendEvent)):
                 try:

@@ -60,6 +60,8 @@ def parse_client_event(data: dict[str, Any]) -> BaseModel:
         return UpstreamAudioAppendEvent.model_validate(data)
     if event_type == "input_audio_buffer.commit":
         return UpstreamAudioCommitEvent.model_validate(data)
+    if event_type == "heartbeat":
+        return Exception("heartbeat")
     raise ValueError(f"unsupported event type: {event_type!r}")
 
 
