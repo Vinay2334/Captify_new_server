@@ -32,7 +32,6 @@ def make_settings(**overrides):
         "SESSION_IDLE_TIMEOUT_SECONDS": 5.0,
         "MAX_AUDIO_BYTES_PER_SECOND": 96000,
         "MAX_WEBSOCKET_MESSAGE_BYTES": 65536,
-        "WEBRTC_AUTO_COMMIT_SECONDS": 1000.0,
     }
     base.update(overrides)
     return Settings(**base)
@@ -97,7 +96,7 @@ def channel_jsons(channel):
 def test_payload_roundtrip_pcm16():
     payload = webrtc_audio_to_upstream_payload(PCM_SMALL)
     decoded = json.loads(payload)
-    assert decoded["type"] == "input_audio_buffer.append"
+    assert decoded["type"] == "session.input_audio_buffer.append"
     assert base64.b64decode(decoded["audio"]) == PCM_SMALL
 
 
@@ -117,7 +116,7 @@ async def test_binary_pcm_forwarded_as_base64_append():
     assert reason == "channel_closed"
     assert json.loads(channel.sent[0])["type"] == "session.ready"
     assert json.loads(upstream.sent[0]) == {
-        "type": "input_audio_buffer.append",
+        "type": "session.input_audio_buffer.append",
         "audio": base64.b64encode(PCM_CHUNK).decode("ascii"),
     }
     assert upstream.closed
@@ -148,14 +147,17 @@ async def test_oversized_binary_rejected():
 
 
 @pytest.mark.asyncio
-async def test_explicit_text_commit_forwarded():
+async def test_explicit_text_commit_swallowed():
     channel, upstream = FakeChannel(), FakeUpstream()
-    await run_session(
+    reason = await run_session(
         channel, upstream, make_settings(), [json.dumps({"type": "audio.commit"})]
     )
-    assert json.loads(upstream.sent[0]) == {
-        "type": "input_audio_buffer.commit"
-    }
+    assert reason == "channel_closed"
+    # Commits are accepted but never forwarded upstream.
+    assert upstream.sent == []
+    assert channel_jsons(channel) == [
+        {"type": "session.ready", "model": "gpt-realtime-translate"}
+    ]
 
 
 @pytest.mark.asyncio
@@ -169,17 +171,15 @@ async def test_text_base64_append_accepted_for_compat():
         [json.dumps({"type": "audio.append", "audio": audio_b64})],
     )
     assert json.loads(upstream.sent[0]) == {
-        "type": "input_audio_buffer.append",
+        "type": "session.input_audio_buffer.append",
         "audio": audio_b64,
     }
 
 
 @pytest.mark.asyncio
-async def test_auto_commit_while_streaming():
+async def test_continuous_streaming_without_commits():
     channel, upstream = FakeChannel(), FakeUpstream()
-    relay = WebRTCRelaySession(
-        channel, upstream, make_settings(WEBRTC_AUTO_COMMIT_SECONDS=0.05)
-    )
+    relay = WebRTCRelaySession(channel, upstream, make_settings())
     task = asyncio.create_task(relay.run())
     await asyncio.sleep(0.05)
     relay.on_channel_message(PCM_SMALL)
@@ -189,16 +189,70 @@ async def test_auto_commit_while_streaming():
     relay.on_channel_close()
     await asyncio.wait_for(task, timeout=5)
     kinds = [json.loads(p)["type"] for p in upstream.sent]
-    assert kinds.count("input_audio_buffer.append") == 2
-    assert "input_audio_buffer.commit" in kinds
+    # Audio streams continuously: only appends, never commits.
+    assert kinds == [
+        "session.input_audio_buffer.append",
+        "session.input_audio_buffer.append",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_final_commit_on_channel_close():
+async def test_no_commit_flushed_on_channel_close():
     channel, upstream = FakeChannel(), FakeUpstream()
     await run_session(channel, upstream, make_settings(), [PCM_SMALL])
     kinds = [json.loads(p)["type"] for p in upstream.sent]
-    assert kinds == ["input_audio_buffer.append", "input_audio_buffer.commit"]
+    assert kinds == ["session.input_audio_buffer.append"]
+
+
+@pytest.mark.asyncio
+async def test_language_config_updates_target_upstream():
+    channel, upstream = FakeChannel(), FakeUpstream()
+    await run_session(
+        channel,
+        upstream,
+        make_settings(),
+        [
+            json.dumps(
+                {
+                    "type": "language-config",
+                    "source_lang": "hi",
+                    "target_lang": "es",
+                }
+            ),
+            # Repeat for the same language: skipped, never re-sent.
+            json.dumps(
+                {
+                    "type": "language-config",
+                    "source_lang": "hi",
+                    "target_lang": "es",
+                }
+            ),
+        ],
+    )
+    assert len(upstream.sent) == 1
+    update = json.loads(upstream.sent[0])
+    assert update["type"] == "session.update"
+    assert update["session"]["audio"]["output"] == {"language": "es"}
+
+
+@pytest.mark.asyncio
+async def test_language_config_matching_default_sends_nothing():
+    channel, upstream = FakeChannel(), FakeUpstream()
+    await run_session(
+        channel,
+        upstream,
+        make_settings(),
+        [
+            json.dumps(
+                {
+                    "type": "language-config",
+                    "source_lang": "hi",
+                    "target_lang": "en",
+                }
+            ),
+        ],
+    )
+    assert upstream.sent == []
 
 
 @pytest.mark.asyncio
@@ -220,16 +274,14 @@ async def test_transcript_events_mapped_to_channel():
         [
             json.dumps(
                 {
-                    "type": "conversation.item.input_audio_transcription.delta",
-                    "item_id": "item_1",
-                    "delta": "Hel",
+                    "type": "session.output_transcript.delta",
+                    "delta": "Hol",
                 }
             ),
             json.dumps(
                 {
-                    "type": "conversation.item.input_audio_transcription.completed",
-                    "item_id": "item_1",
-                    "transcript": "Hello.",
+                    "type": "session.output_transcript.delta",
+                    "delta": "a.",
                 }
             ),
         ]
@@ -242,7 +294,9 @@ async def test_transcript_events_mapped_to_channel():
     upstream.disconnect()
     await asyncio.wait_for(task, timeout=5)
     kinds = [m["type"] for m in channel_jsons(channel)]
-    assert kinds == ["session.ready", "transcript.delta", "transcript.completed"]
+    assert kinds == ["session.ready", "transcript.delta", "transcript.delta"]
+    assert channel_jsons(channel)[1]["delta"] == "Hol"
+    assert channel_jsons(channel)[2]["delta"] == "a."
 
 
 @pytest.mark.asyncio

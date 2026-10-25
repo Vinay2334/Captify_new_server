@@ -1,19 +1,22 @@
 """Upstream OpenAI Realtime API WebSocket client.
 
 One instance per connected extension client. Opens
-``wss://api.openai.com/v1/realtime?intent=transcription`` (configurable),
-authenticates with the server-side API key, and configures a transcription
-session (``gpt-live-transcribe`` by default).
+``wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate``
+(configurable), authenticates with the server-side API key, and configures a
+translation session (``gpt-realtime-translate`` by default).
 
-Wire contract verified against the official OpenAI Realtime transcription
-guide (developers.openai.com, October 2025+):
-  C->S  {"type": "session.update", "session": {"type": "transcription",
-          "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000},
-          "transcription": {"model": ...}, "turn_detection": null}}}}
-  C->S  {"type": "input_audio_buffer.append", "audio": "<base64 PCM16>"}
-  C->S  {"type": "input_audio_buffer.commit"}
-  S->C  {"type": "conversation.item.input_audio_transcription.delta", ...}
-  S->C  {"type": "conversation.item.input_audio_transcription.completed", ...}
+Wire contract verified against the official OpenAI Realtime translation
+guide and translation client/server event references
+(developers.openai.com, 2026):
+  C->S  {"type": "session.update", "session":
+          {"audio": {"input": {"transcription": {"model": ...},
+          "noise_reduction": {"type": "near_field"}},
+          "output": {"language": "<target>"}}}}
+  C->S  {"type": "session.input_audio_buffer.append", "audio": "<base64 PCM16>"}
+There is no commit / turn lifecycle: translation streams continuously.
+  S->C  {"type": "session.output_transcript.delta", "delta": ..., ...}
+  S->C  {"type": "session.input_transcript.delta", "delta": ..., ...}
+  S->C  {"type": "session.output_audio.delta", "delta": ..., ...}
 """
 
 import asyncio
@@ -26,24 +29,29 @@ from app.schemas.events import UpstreamError
 log = get_logger(__name__)
 
 
-def build_session_update(model: str) -> str:
-    """Session configuration for transcription (manual commit, 24 kHz PCM).
+def build_session_update(
+    target_language: str,
+    transcription_model: str = "gpt-realtime-whisper",
+) -> str:
+    """Session configuration for translation (continuous, 24 kHz PCM).
 
-    ``turn_detection`` is null: ``gpt-live-transcribe`` does not support
-    server VAD, so the extension commits each audio turn explicitly.
+    Translation sessions have no commit / turn lifecycle: audio streams
+    continuously with the ``session.``-prefixed append event, the source
+    language is auto-detected, and only the output ``language`` is set.
+    The transcription model only controls source-language transcript
+    deltas; translation itself always runs from the input audio stream.
     """
     return json.dumps(
         {
             "type": "session.update",
             "session": {
-                "type": "transcription",
                 "audio": {
                     "input": {
-                        "format": {"type": "audio/pcm", "rate": 24000},
-                        "transcription": {"model": model},
-                        "turn_detection": None,
-                    }
-                },
+                        "transcription": {"model": transcription_model},
+                        "noise_reduction": {"type": "near_field"},
+                    },
+                    "output": {"language": target_language},
+                }
             },
         }
     )
@@ -59,17 +67,25 @@ class OpenAIRealtimeClient:
         url: str,
         beta_header: str = "realtime=v1",
         connect_timeout: float = 15.0,
+        target_language: str = "en",
+        transcription_model: str = "gpt-realtime-whisper",
     ) -> None:
         self._api_key = api_key
         self._model = model
         self._url = url
         self._beta_header = beta_header
         self._connect_timeout = connect_timeout
+        self._target_language = target_language
+        self._transcription_model = transcription_model
         self._ws: Any = None
 
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def target_language(self) -> str:
+        return self._target_language
 
     async def connect(self) -> None:
         """Open the upstream socket and configure the session."""
@@ -101,16 +117,20 @@ class OpenAIRealtimeClient:
         except (asyncio.TimeoutError, TimeoutError) as exc:
             raise UpstreamError(
                 code="connect_timeout",
-                message="could not reach transcription service",
+                message="could not reach translation service",
             ) from exc
         except OSError as exc:
             raise UpstreamError(
                 code="connect_failed",
-                message="could not reach transcription service",
+                message="could not reach translation service",
             ) from exc
 
         try:
-            await self._ws.send(build_session_update(self._model))
+            await self._ws.send(
+                build_session_update(
+                    self._target_language, self._transcription_model
+                )
+            )
         except Exception as exc:
             await self.close()
             log.warning(
@@ -119,23 +139,27 @@ class OpenAIRealtimeClient:
             )
             raise UpstreamError(
                 code="connect_failed",
-                message="could not start transcription session",
+                message="could not start translation session",
             ) from exc
-        log.info("upstream session configured model=%s", self._model)
+        log.info(
+            "upstream session configured model=%s target_language=%s",
+            self._model,
+            self._target_language,
+        )
 
     def _status_to_error(self, exc: Exception) -> UpstreamError:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         if status in (401, 403):
             return UpstreamError(
                 code="auth_failed",
-                message="transcription service authentication failed",
+                message="translation service authentication failed",
             )
         if status == 429:
             return UpstreamError(
-                code="rate_limited", message="transcription service is busy"
+                code="rate_limited", message="translation service is busy"
             )
         return UpstreamError(
-            code="upstream_error", message="transcription service unavailable"
+            code="upstream_error", message="translation service unavailable"
         )
 
     async def send_text(self, payload: str) -> None:

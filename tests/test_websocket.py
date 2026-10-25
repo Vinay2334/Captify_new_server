@@ -90,7 +90,7 @@ def test_connect_without_auth_gets_ready():
     with client.websocket_connect("/api/v1/transcription/ws") as ws:
         msg = json.loads(ws.receive_text())
         assert msg["type"] == "session.ready"
-        assert msg["model"] == "gpt-live-transcribe"
+        assert msg["model"] == "gpt-realtime-translate"
     assert fakes[0].connected
     assert wait_for(lambda: fakes[0].closed)
 
@@ -102,18 +102,19 @@ def test_audio_append_forwarded_verbatim_upstream():
         ws.send_text(json.dumps({"type": "audio.append", "audio": AUDIO_B64}))
         assert wait_for(lambda: len(fakes[0].sent) == 1)
         assert json.loads(fakes[0].sent[0]) == {
-            "type": "input_audio_buffer.append",
+            "type": "session.input_audio_buffer.append",
             "audio": AUDIO_B64,
         }
 
 
-def test_audio_commit_forwarded():
+def test_audio_commit_swallowed_never_forwarded():
     client, fakes, _ = make_client()
     with client.websocket_connect("/api/v1/transcription/ws") as ws:
-        ws.receive_text()
+        ws.receive_text()  # session.ready
         ws.send_text(json.dumps({"type": "audio.commit"}))
-        assert wait_for(lambda: len(fakes[0].sent) == 1)
-        assert json.loads(fakes[0].sent[0]) == {"type": "input_audio_buffer.commit"}
+        # Give the relay a beat, then verify nothing went upstream.
+        assert not wait_for(lambda: len(fakes[0].sent) == 1, timeout=0.5)
+        assert fakes[0].sent == []
 
 
 def test_native_openai_audio_events_accepted():
@@ -124,37 +125,55 @@ def test_native_openai_audio_events_accepted():
             json.dumps({"type": "input_audio_buffer.append", "audio": AUDIO_B64})
         )
         assert wait_for(lambda: len(fakes[0].sent) == 1)
+        assert json.loads(fakes[0].sent[0]) == {
+            "type": "session.input_audio_buffer.append",
+            "audio": AUDIO_B64,
+        }
 
 
-def test_transcript_delta_and_completed_forwarded():
+def test_native_translate_append_event_accepted():
+    client, fakes, _ = make_client()
+    with client.websocket_connect("/api/v1/transcription/ws") as ws:
+        ws.receive_text()
+        ws.send_text(
+            json.dumps(
+                {"type": "session.input_audio_buffer.append", "audio": AUDIO_B64}
+            )
+        )
+        assert wait_for(lambda: len(fakes[0].sent) == 1)
+        assert json.loads(fakes[0].sent[0]) == {
+            "type": "session.input_audio_buffer.append",
+            "audio": AUDIO_B64,
+        }
+
+
+def test_translated_transcript_deltas_forwarded():
     client, fakes, _ = make_client()
     with client.websocket_connect("/api/v1/transcription/ws") as ws:
         assert json.loads(ws.receive_text())["type"] == "session.ready"
         fakes[0].inject(
             {
-                "type": "conversation.item.input_audio_transcription.delta",
-                "item_id": "item_1",
-                "delta": "Hel",
+                "type": "session.output_transcript.delta",
+                "delta": "Hol",
             }
         )
         fakes[0].inject(
             {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "item_id": "item_1",
-                "transcript": "Hello.",
+                "type": "session.output_transcript.delta",
+                "delta": "a.",
             }
         )
         first = json.loads(ws.receive_text())
         second = json.loads(ws.receive_text())
         assert first == {
             "type": "transcript.delta",
-            "delta": "Hel",
-            "item_id": "item_1",
+            "delta": "Hol",
+            "item_id": "",
         }
         assert second == {
-            "type": "transcript.completed",
-            "transcript": "Hello.",
-            "item_id": "item_1",
+            "type": "transcript.delta",
+            "delta": "a.",
+            "item_id": "",
         }
 
 
@@ -169,7 +188,7 @@ def test_invalid_event_rejected_connection_survives():
         err = json.loads(ws.receive_text())
         assert err["code"] == "invalid_event"
         # Connection still usable afterwards.
-        ws.send_text(json.dumps({"type": "audio.commit"}))
+        ws.send_text(json.dumps({"type": "audio.append", "audio": AUDIO_B64}))
         assert wait_for(lambda: len(fakes[0].sent) == 1)
 
 
@@ -236,9 +255,8 @@ def test_no_api_key_leakage_in_responses(caplog):
         assert wait_for(lambda: len(fakes[0].sent) == 1)
         fakes[0].inject(
             {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "item_id": "x",
-                "transcript": "hi",
+                "type": "session.output_transcript.delta",
+                "delta": "hi",
             }
         )
         seen.append(ws.receive_text())

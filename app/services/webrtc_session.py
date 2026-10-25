@@ -9,14 +9,14 @@ Extension contract (see ``extensionRTC/offscreen.js`` + ``rtc-config.js``):
 - Text messages: optional JSON client events using the same schema as the
   WebSocket endpoint (``audio.commit`` et al), for forward compatibility.
   The extension currently never sends commits.
-- The upstream transcription session uses manual commits
-  (``turn_detection`` is null), so this bridge auto-commits every
-  ``WEBRTC_AUTO_COMMIT_SECONDS`` while audio is flowing, plus one final
-  commit on channel close when audio is still uncommitted.
-- Transcripts flow back as JSON text on the same channel
-  (``session.ready`` / ``transcript.delta`` / ``transcript.completed`` /
-  ``error``), mirroring the WebSocket endpoint's downstream schema. The
-  current extension build only logs them.
+- The upstream translation session is continuous (no commits, no turn
+  lifecycle), so this bridge forwards audio as it arrives: no auto-commit
+  timer and no final commit on channel close.
+- Translated transcripts flow back as JSON text on the same channel
+  (``session.ready`` / ``transcript.delta`` / ``error``), mirroring the
+  WebSocket endpoint's downstream schema. Translation emits deltas only,
+  so ``transcript.completed`` never fires. The current extension build
+  only logs them.
 """
 
 import asyncio
@@ -31,6 +31,7 @@ from app.core.logging import get_logger
 from app.schemas.events import (
     AudioAppendEvent,
     ErrorEvent,
+    LanguageConfigEvent,
     SessionReadyEvent,
     TranscriptCompletedEvent,
     TranscriptDeltaEvent,
@@ -39,6 +40,7 @@ from app.schemas.events import (
     map_upstream_event,
     parse_client_event,
 )
+from app.services.openai_realtime import build_session_update
 from app.services.relay import (
     UPSTREAM_SEND_TIMEOUT_SECONDS,
     AudioThroughputLimiter,
@@ -64,9 +66,9 @@ class DataChannel(Protocol):
 def webrtc_audio_to_upstream_payload(raw: bytes) -> str:
     """Validate one raw PCM16 DataChannel message and map it upstream.
 
-    Returns the ``input_audio_buffer.append`` JSON payload with the audio
-    base64-encoded (upstream only accepts base64). Raises ValueError for
-    empty or odd-length payloads, which cannot be Int16 samples.
+    Returns the ``session.input_audio_buffer.append`` JSON payload with the
+    audio base64-encoded (upstream only accepts base64). Raises ValueError
+    for empty or odd-length payloads, which cannot be Int16 samples.
     """
     if not raw or len(raw) % 2 != 0:
         raise ValueError("audio payload must be non-empty Int16 PCM bytes")
@@ -74,7 +76,9 @@ def webrtc_audio_to_upstream_payload(raw: bytes) -> str:
         audio_b64 = base64.b64encode(raw).decode("ascii")
     except (binascii.Error, ValueError) as exc:
         raise ValueError("could not encode audio payload") from exc
-    return json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64})
+    return json.dumps(
+        {"type": "session.input_audio_buffer.append", "audio": audio_b64}
+    )
 
 
 class WebRTCRelaySession:
@@ -102,11 +106,12 @@ class WebRTCRelaySession:
         self._on_message = on_message
         self._audio_chunks = 0
         self._audio_bytes = 0
-        self._commits = 0
         self._upstream_events = 0
-        self._audio_since_commit = 0
+        # Target language already applied upstream by the initial
+        # session.update sent at connect time. Repeat language-config
+        # events for the same language are skipped, never re-sent.
+        self._applied_target_language = settings.translation_target_language
         self._session_start = time.monotonic()
-        self._last_commit = self._session_start
         self._last_audio_log = self._session_start
         self._last_logged_chunks = 0
         self._last_logged_bytes = 0
@@ -145,11 +150,10 @@ class WebRTCRelaySession:
             self._audio_bytes / self._audio_chunks if self._audio_chunks else 0.0
         )
         log.info(
-            "webrtc audio flow chunks=%d bytes=%d commits=%d "
+            "webrtc audio flow chunks=%d bytes=%d "
             "avg_chunk=%.0fB overall=%.0fB/s interval=%.0fB/s elapsed=%.1fs",
             self._audio_chunks,
             self._audio_bytes,
-            self._commits,
             avg_chunk,
             self._audio_bytes / total_elapsed,
             interval_rate,
@@ -163,11 +167,10 @@ class WebRTCRelaySession:
         elapsed = time.monotonic() - self._session_start
         log.info(
             "webrtc audio session ended reason=%s chunks=%d bytes=%d "
-            "commits=%d upstream_events=%d elapsed=%.1fs overall=%.0fB/s",
+            "upstream_events=%d elapsed=%.1fs overall=%.0fB/s",
             reason,
             self._audio_chunks,
             self._audio_bytes,
-            self._commits,
             self._upstream_events,
             elapsed,
             self._audio_bytes / max(elapsed, 1e-6),
@@ -230,7 +233,28 @@ class WebRTCRelaySession:
         except Exception:
             pass
 
-    async def _forward_upstream(self, payload: str, *, is_commit: bool) -> bool:
+    async def _apply_language_config(
+        self, event: LanguageConfigEvent
+    ) -> str | None:
+        """Forward a target-language change upstream. Returns stop reason."""
+        if event.target_lang == self._applied_target_language:
+            log.debug("language unchanged target=%s", event.target_lang)
+            return None
+        payload = build_session_update(
+            event.target_lang,
+            self._settings.translation_transcription_model,
+        )
+        ok = await self._forward_upstream(payload)
+        if not ok:
+            return "upstream_send_failed"
+        self._applied_target_language = event.target_lang
+        log.info(
+            "webrtc translation target language updated target=%s",
+            event.target_lang,
+        )
+        return None
+
+    async def _forward_upstream(self, payload: str) -> bool:
         """Send one payload upstream. Returns False when upstream is gone."""
         try:
             await asyncio.wait_for(
@@ -242,43 +266,10 @@ class WebRTCRelaySession:
                 "webrtc upstream send failed type=%s", type(exc).__name__
             )
             self._send_channel_error(
-                "upstream_error", "transcription service unavailable"
+                "upstream_error", "translation service unavailable"
             )
             return False
-        if is_commit:
-            self._commits += 1
-            log.info(
-                "webrtc audio commit #%d forwarded after chunks=%d bytes=%d",
-                self._commits,
-                self._audio_chunks,
-                self._audio_bytes,
-            )
         return True
-
-    async def _maybe_auto_commit(self) -> bool:
-        """Commit when audio has piled up past the auto-commit interval."""
-        if not self._audio_since_commit:
-            return True
-        interval = self._settings.webrtc_auto_commit_seconds
-        if time.monotonic() - self._last_commit < interval:
-            return True
-        ok = await self._forward_upstream(
-            json.dumps({"type": "input_audio_buffer.commit"}), is_commit=True
-        )
-        if ok:
-            self._last_commit = time.monotonic()
-            self._audio_since_commit = 0
-        return ok
-
-    async def _final_commit_if_pending(self) -> bool:
-        if not self._audio_since_commit:
-            return True
-        ok = await self._forward_upstream(
-            json.dumps({"type": "input_audio_buffer.commit"}), is_commit=True
-        )
-        if ok:
-            self._audio_since_commit = 0
-        return ok
 
     def _count_audio_bytes(self, size: int, *, source: str) -> bool:
         """Apply the throughput limiter and count one chunk. True if kept."""
@@ -297,7 +288,6 @@ class WebRTCRelaySession:
             return False
         self._audio_chunks += 1
         self._audio_bytes += size
-        self._audio_since_commit += size
         if self._audio_chunks == 1:
             log.info(
                 "webrtc audio stream started first_chunk=%dB source=%s",
@@ -324,10 +314,8 @@ class WebRTCRelaySession:
             return None
         if not self._count_audio_bytes(len(raw), source="pcm16"):
             return None
-        ok = await self._forward_upstream(payload, is_commit=False)
+        ok = await self._forward_upstream(payload)
         if not ok:
-            return "upstream_send_failed"
-        if not await self._maybe_auto_commit():
             return "upstream_send_failed"
         return None
 
@@ -352,6 +340,8 @@ class WebRTCRelaySession:
                 "invalid_event", "unsupported or malformed event"
             )
             return None
+        if isinstance(event, LanguageConfigEvent):
+            return await self._apply_language_config(event)
         if isinstance(event, (AudioAppendEvent, UpstreamAudioAppendEvent)):
             try:
                 import base64 as _b64
@@ -365,22 +355,19 @@ class WebRTCRelaySession:
             if not self._count_audio_bytes(size, source="base64"):
                 return None
             payload = json.dumps(
-                {"type": "input_audio_buffer.append", "audio": event.audio}
+                {
+                    "type": "session.input_audio_buffer.append",
+                    "audio": event.audio,
+                }
             )
-            ok = await self._forward_upstream(payload, is_commit=False)
+            ok = await self._forward_upstream(payload)
             if not ok:
                 return "upstream_send_failed"
-            if not await self._maybe_auto_commit():
-                return "upstream_send_failed"
             return None
-        # Commit (audio.commit / input_audio_buffer.commit): forward as-is.
-        ok = await self._forward_upstream(
-            json.dumps({"type": "input_audio_buffer.commit"}), is_commit=True
-        )
-        if not ok:
-            return "upstream_send_failed"
-        self._last_commit = time.monotonic()
-        self._audio_since_commit = 0
+        # Commit (audio.commit / input_audio_buffer.commit): accepted for
+        # extension compatibility but swallowed, never forwarded. The
+        # translation session is continuous and has no commit lifecycle.
+        log.debug("commit swallowed type=%s", event.type)
         return None
 
     async def _channel_to_upstream(self) -> str:
@@ -396,10 +383,10 @@ class WebRTCRelaySession:
                 )
                 return "idle_timeout"
             if message is None:
-                # DataChannel closed: flush one final commit if audio is
-                # still uncommitted so the tail of the recording is kept.
-                ok = await self._final_commit_if_pending()
-                return "channel_closed" if ok else "upstream_send_failed"
+                # DataChannel closed. The translation session is
+                # continuous, so there is nothing to flush: the tail of
+                # the recording was already streamed.
+                return "channel_closed"
             if isinstance(message, str):
                 stop = await self._handle_text_event(message)
             elif isinstance(message, (bytes, bytearray, memoryview)):
@@ -410,8 +397,6 @@ class WebRTCRelaySession:
                 )
                 continue
             if stop is not None:
-                if stop == "message_too_large":
-                    await self._final_commit_if_pending()
                 return stop
 
     async def _upstream_to_channel(self) -> str:

@@ -9,9 +9,11 @@ Extension protocol (client <-> backend), JSON text frames:
   S->C  {"type": "error", "code": "...", "message": "..."}
 
 The backend also accepts the OpenAI-native ``input_audio_buffer.append`` /
-``input_audio_buffer.commit`` events from the extension and forwards them
-after validation, so an extension that already speaks the Realtime wire
-format keeps working.
+``input_audio_buffer.commit`` and ``session.input_audio_buffer.append`` /
+``session.input_audio_buffer.commit`` events from the extension: appends
+are forwarded as translation appends after validation, commits are
+swallowed. An extension that already speaks the Realtime wire format
+keeps working.
 """
 
 from typing import Any, Literal
@@ -31,14 +33,35 @@ class AudioCommitEvent(BaseModel):
 
 
 class UpstreamAudioAppendEvent(BaseModel):
-    """OpenAI-native audio chunk, accepted from the extension as-is."""
+    """OpenAI-native audio chunk, accepted from the extension as-is.
 
-    type: Literal["input_audio_buffer.append"]
+    Both the legacy transcription name and the translation
+    ``session.``-prefixed name are accepted; both map to the translation
+    append event upstream.
+    """
+
+    type: Literal["input_audio_buffer.append", "session.input_audio_buffer.append"]
     audio: str = Field(min_length=1)
 
 
 class UpstreamAudioCommitEvent(BaseModel):
-    type: Literal["input_audio_buffer.commit"]
+    """OpenAI-native commit, accepted but swallowed (no commit lifecycle)."""
+
+    type: Literal["input_audio_buffer.commit", "session.input_audio_buffer.commit"]
+
+
+class LanguageConfigEvent(BaseModel):
+    """Per-session language selection sent by the extension.
+
+    ``target_lang`` is forwarded upstream as a ``session.update`` output
+    language. ``source_lang`` is accepted for forward compatibility but
+    currently unused: the translation session always auto-detects the
+    source language and the API exposes no source-language field.
+    """
+
+    type: Literal["language-config"]
+    source_lang: str = Field(min_length=1)
+    target_lang: str = Field(min_length=1)
 
 
 CLIENT_EVENT_TYPES = {
@@ -46,6 +69,9 @@ CLIENT_EVENT_TYPES = {
     "audio.commit",
     "input_audio_buffer.append",
     "input_audio_buffer.commit",
+    "session.input_audio_buffer.append",
+    "session.input_audio_buffer.commit",
+    "language-config",
 }
 
 
@@ -56,10 +82,18 @@ def parse_client_event(data: dict[str, Any]) -> BaseModel:
         return AudioAppendEvent.model_validate(data)
     if event_type == "audio.commit":
         return AudioCommitEvent.model_validate(data)
-    if event_type == "input_audio_buffer.append":
+    if event_type in (
+        "input_audio_buffer.append",
+        "session.input_audio_buffer.append",
+    ):
         return UpstreamAudioAppendEvent.model_validate(data)
-    if event_type == "input_audio_buffer.commit":
+    if event_type in (
+        "input_audio_buffer.commit",
+        "session.input_audio_buffer.commit",
+    ):
         return UpstreamAudioCommitEvent.model_validate(data)
+    if event_type == "language-config":
+        return LanguageConfigEvent.model_validate(data)
     if event_type == "heartbeat":
         return Exception("heartbeat")
     raise ValueError(f"unsupported event type: {event_type!r}")
@@ -93,21 +127,26 @@ class ErrorEvent(BaseModel):
 # --- upstream -> backend mapping ---
 
 # Upstream events relayed (in mapped form) to the extension.
-UPSTREAM_DELTA_TYPE = "conversation.item.input_audio_transcription.delta"
-UPSTREAM_COMPLETED_TYPE = "conversation.item.input_audio_transcription.completed"
+# Translation emits deltas only (no completed turns): the translated
+# ``session.output_transcript.delta`` text becomes the extension's
+# ``transcript.delta`` captions. Translation sessions have no ``item_id``,
+# so the downstream field stays empty.
+UPSTREAM_DELTA_TYPE = "session.output_transcript.delta"
 
 # Upstream events that are expected but carry nothing for the extension.
-# They are consumed silently (session lifecycle, buffer acks).
+# They are consumed silently:
+# - session lifecycle (created / updated / closed),
+# - source-language ``session.input_transcript.delta`` (the downstream
+#   protocol carries a single translated caption stream),
+# - translated ``session.output_audio.delta`` (the downstream protocol is
+#   text-only; no audio is forwarded).
 UPSTREAM_IGNORED_TYPES = frozenset(
     {
         "session.created",
         "session.updated",
-        "input_audio_buffer.committed",
-        "input_audio_buffer.cleared",
-        "input_audio_buffer.speech_started",
-        "input_audio_buffer.speech_stopped",
-        "conversation.item.created",
-        "rate_limits.updated",
+        "session.closed",
+        "session.input_transcript.delta",
+        "session.output_audio.delta",
     }
 )
 
@@ -122,11 +161,6 @@ def map_upstream_event(event: dict[str, Any]) -> BaseModel | None:
     if event_type == UPSTREAM_DELTA_TYPE:
         return TranscriptDeltaEvent(
             delta=event.get("delta", ""),
-            item_id=event.get("item_id", ""),
-        )
-    if event_type == UPSTREAM_COMPLETED_TYPE:
-        return TranscriptCompletedEvent(
-            transcript=event.get("transcript", ""),
             item_id=event.get("item_id", ""),
         )
     if event_type in UPSTREAM_IGNORED_TYPES:
@@ -150,7 +184,7 @@ class UpstreamError(Exception):
         raw_code = str(inner.get("code", event.get("code", "upstream_error")))
         # Redact: only pass through short known-safe codes, else generic.
         code = raw_code if len(raw_code) <= 64 else "upstream_error"
-        return cls(code=code, message="transcription upstream error")
+        return cls(code=code, message="translation upstream error")
 
     def to_client_event(self) -> ErrorEvent:
         return ErrorEvent(code=self.code, message=self.message)

@@ -17,11 +17,11 @@ log = get_logger(__name__)
 async def lifespan(app: FastAPI):
     if not app.state.settings.openai_api_key:
         log.warning(
-            "OPENAI_API_KEY is not set: transcription sessions will be "
+            "OPENAI_API_KEY is not set: translation sessions will be "
             "rejected until it is configured"
         )
     log.warning(
-        "transcription endpoint has no user authentication: anyone able to "
+        "translation endpoint has no user authentication: anyone able to "
         "reach it may consume OpenAI API quota; keep it on localhost"
     )
     yield
@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
 def create_app(app_settings: Settings | None = None) -> FastAPI:
     resolved = app_settings or default_settings
     configure_logging(resolved.log_level)
-    app = FastAPI(title="Captify Transcription Backend", lifespan=lifespan)
+    app = FastAPI(title="Captify Translation Backend", lifespan=lifespan)
     app.state.settings = resolved
     app.state.slot_lock = asyncio.Lock()
     app.state.active_sessions = 0

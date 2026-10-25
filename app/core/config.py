@@ -14,11 +14,23 @@ class Settings(BaseSettings):
     # OpenAI Realtime API (server side only - never sent to the extension).
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_realtime_model: str = Field(
-        default="gpt-live-transcribe", alias="OPENAI_REALTIME_MODEL"
+        default="gpt-realtime-translate", alias="OPENAI_REALTIME_MODEL"
     )
     openai_realtime_url: str = Field(
-        default="wss://api.openai.com/v1/realtime?intent=transcription",
+        default="wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate",
         alias="OPENAI_REALTIME_URL",
+    )
+    # Target language for translated output audio and transcript deltas.
+    # Source language is auto-detected. Supported codes include: es, pt,
+    # fr, ja, ru, zh, de, ko, hi, id, vi, it, en.
+    translation_target_language: str = Field(
+        default="en", min_length=1, alias="OPENAI_TRANSLATION_TARGET_LANGUAGE"
+    )
+    # Transcription model used only for source-language transcript deltas.
+    # Translation itself runs from the input audio stream regardless.
+    translation_transcription_model: str = Field(
+        default="gpt-realtime-whisper",
+        alias="OPENAI_TRANSLATION_TRANSCRIPTION_MODEL",
     )
     openai_beta_header: str = Field(default="realtime=v1", alias="OPENAI_BETA_HEADER")
     upstream_connect_timeout_seconds: float = Field(
@@ -47,13 +59,10 @@ class Settings(BaseSettings):
 
     # WebRTC DataChannel audio (extensionRTC build). The label must match
     # DATA_CHANNEL_LABEL in extensionRTC/rtc-config.js. The extension
-    # streams continuously without commits while the upstream session
-    # needs manual commits, so the server auto-commits while audio flows.
+    # streams continuously; the upstream translation session is also
+    # continuous (no commits), so audio is forwarded as it arrives.
     webrtc_data_channel_label: str = Field(
         default="audio", alias="WEBRTC_DATA_CHANNEL_LABEL"
-    )
-    webrtc_auto_commit_seconds: float = Field(
-        default=5.0, alias="WEBRTC_AUTO_COMMIT_SECONDS"
     )
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
@@ -69,7 +78,7 @@ class Settings(BaseSettings):
             raise ValueError("must be positive")
         return value
 
-    @field_validator("session_idle_timeout_seconds", "webrtc_auto_commit_seconds")
+    @field_validator("session_idle_timeout_seconds")
     @classmethod
     def _positive_float(cls, value: float) -> float:
         if value <= 0:

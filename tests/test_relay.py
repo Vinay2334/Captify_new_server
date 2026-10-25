@@ -91,10 +91,87 @@ def test_decode_audio_size_passthrough():
 
 def test_to_upstream_payload_keeps_audio_verbatim():
     payload = to_upstream_payload(AudioAppendEvent(type="audio.append", audio=AUDIO_B64))
+    assert payload is not None
     assert json.loads(payload) == {
-        "type": "input_audio_buffer.append",
+        "type": "session.input_audio_buffer.append",
         "audio": AUDIO_B64,
     }
+
+
+def test_to_upstream_payload_swallows_commits():
+    from app.schemas.events import AudioCommitEvent, UpstreamAudioCommitEvent
+
+    assert to_upstream_payload(AudioCommitEvent(type="audio.commit")) is None
+    assert (
+        to_upstream_payload(
+            UpstreamAudioCommitEvent(type="input_audio_buffer.commit")
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_language_config_updates_target_upstream():
+    client = FakeClient(
+        [
+            json.dumps(
+                {
+                    "type": "language-config",
+                    "source_lang": "hi",
+                    "target_lang": "es",
+                }
+            ),
+            # Repeat for the same language: skipped, never re-sent.
+            json.dumps(
+                {
+                    "type": "language-config",
+                    "source_lang": "hi",
+                    "target_lang": "es",
+                }
+            ),
+            json.dumps({"type": "audio.append", "audio": AUDIO_B64}),
+        ]
+    )
+    upstream = FakeUpstream()
+    relay = RelaySession(client, upstream, make_settings())
+    task = asyncio.create_task(relay.run())
+    await asyncio.sleep(0.3)
+    client.disconnect()
+    upstream.disconnect()
+    await asyncio.wait_for(task, timeout=5)
+    assert len(upstream.sent) == 2
+    update = json.loads(upstream.sent[0])
+    assert update["type"] == "session.update"
+    assert update["session"]["audio"]["output"] == {"language": "es"}
+    assert json.loads(upstream.sent[1]) == {
+        "type": "session.input_audio_buffer.append",
+        "audio": AUDIO_B64,
+    }
+    assert relay._applied_target_language == "es"
+
+
+@pytest.mark.asyncio
+async def test_language_config_matching_default_sends_nothing():
+    client = FakeClient(
+        [
+            json.dumps(
+                {
+                    "type": "language-config",
+                    "source_lang": "hi",
+                    "target_lang": "en",
+                }
+            ),
+        ]
+    )
+    upstream = FakeUpstream()
+    relay = RelaySession(client, upstream, make_settings())
+    task = asyncio.create_task(relay.run())
+    await asyncio.sleep(0.2)
+    client.disconnect()
+    upstream.disconnect()
+    await asyncio.wait_for(task, timeout=5)
+    assert upstream.sent == []
+    assert client.sent == []
 
 
 def test_throughput_limiter():
@@ -117,14 +194,14 @@ async def test_audio_append_forwarded_verbatim():
     assert reason in ("client_disconnected", "upstream_disconnected", "closed")
     assert len(upstream.sent) == 1
     assert json.loads(upstream.sent[0]) == {
-        "type": "input_audio_buffer.append",
+        "type": "session.input_audio_buffer.append",
         "audio": AUDIO_B64,
     }
     assert upstream.closed and client.closed is not None
 
 
 @pytest.mark.asyncio
-async def test_audio_commit_forwarded():
+async def test_audio_commit_swallowed_never_forwarded():
     client = FakeClient([json.dumps({"type": "audio.commit"})])
     upstream = FakeUpstream()
     relay = RelaySession(client, upstream, make_settings())
@@ -133,28 +210,41 @@ async def test_audio_commit_forwarded():
     client.disconnect()
     upstream.disconnect()
     await asyncio.wait_for(task, timeout=5)
-    assert json.loads(upstream.sent[0]) == {"type": "input_audio_buffer.commit"}
+    # No upstream payload, no client error: commits are silently swallowed.
+    assert upstream.sent == []
+    assert client.sent == []
 
 
 @pytest.mark.asyncio
-async def test_transcript_events_mapped_downstream():
+async def test_translated_transcript_deltas_mapped_downstream():
     upstream = FakeUpstream(
         [
             json.dumps(
                 {
-                    "type": "conversation.item.input_audio_transcription.delta",
-                    "item_id": "item_1",
+                    "type": "session.output_transcript.delta",
+                    "delta": "Hol",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "session.output_transcript.delta",
+                    "delta": "a.",
+                }
+            ),
+            json.dumps({"type": "session.updated", "session": {}}),
+            # Source-language deltas and translated audio stay upstream.
+            json.dumps(
+                {
+                    "type": "session.input_transcript.delta",
                     "delta": "Hel",
                 }
             ),
             json.dumps(
                 {
-                    "type": "conversation.item.input_audio_transcription.completed",
-                    "item_id": "item_1",
-                    "transcript": "Hello.",
+                    "type": "session.output_audio.delta",
+                    "delta": "AQID",
                 }
             ),
-            json.dumps({"type": "session.updated", "session": {}}),
         ]
     )
     client = FakeClient()
@@ -165,9 +255,9 @@ async def test_transcript_events_mapped_downstream():
     upstream.disconnect()
     await asyncio.wait_for(task, timeout=5)
     kinds = [json.loads(m)["type"] for m in client.sent]
-    assert kinds == ["transcript.delta", "transcript.completed"]
-    assert json.loads(client.sent[0])["delta"] == "Hel"
-    assert json.loads(client.sent[1])["transcript"] == "Hello."
+    assert kinds == ["transcript.delta", "transcript.delta"]
+    assert json.loads(client.sent[0])["delta"] == "Hol"
+    assert json.loads(client.sent[1])["delta"] == "a."
 
 
 @pytest.mark.asyncio
@@ -213,18 +303,20 @@ async def test_throughput_limit_drops_chunk_with_error():
     client = FakeClient(
         [
             json.dumps({"type": "audio.append", "audio": AUDIO_B64}),
+            json.dumps({"type": "audio.append", "audio": AUDIO_B64}),
             json.dumps({"type": "audio.commit"}),
         ]
     )
     upstream = FakeUpstream()
-    # 3 decoded bytes per chunk, budget of 3: first ok, rest dropped.
+    # 3 decoded bytes per chunk, budget of 3: first ok, second dropped,
+    # commit swallowed (never forwarded, never rate-limited).
     relay = RelaySession(client, upstream, make_settings(MAX_AUDIO_BYTES_PER_SECOND=3))
     task = asyncio.create_task(relay.run())
     await asyncio.sleep(0.3)
     client.disconnect()
     upstream.disconnect()
     await asyncio.wait_for(task, timeout=5)
-    assert len(upstream.sent) == 1  # commit dropped, append forwarded
+    assert len(upstream.sent) == 1  # only the first append forwarded
     assert json.loads(client.sent[0])["code"] == "rate_limited"
 
 

@@ -4,9 +4,12 @@ Two concurrent tasks per connection, no queues, no full-recording buffer:
 
 - client -> upstream: validate each client event, enforce size / throughput
   limits, forward permitted audio events upstream (base64 payloads pass
-  through untouched, never decoded and re-encoded).
-- upstream -> client: map supported transcription events downstream, drop
-  everything else, convert upstream errors to safe client errors.
+  through untouched, never decoded and re-encoded). The translation
+  session is continuous, so client commit events are accepted (the
+  extension still sends them) but swallowed, never forwarded.
+- upstream -> client: map supported translation transcript events
+  downstream, drop everything else, convert upstream errors to safe
+  client errors.
 
 When either side ends, both tasks are cancelled and both sockets closed.
 """
@@ -23,6 +26,7 @@ from app.core.logging import get_logger
 from app.schemas.events import (
     AudioAppendEvent,
     ErrorEvent,
+    LanguageConfigEvent,
     TranscriptCompletedEvent,
     TranscriptDeltaEvent,
     UpstreamAudioAppendEvent,
@@ -30,6 +34,7 @@ from app.schemas.events import (
     map_upstream_event,
     parse_client_event,
 )
+from app.services.openai_realtime import build_session_update
 
 log = get_logger(__name__)
 
@@ -81,13 +86,19 @@ def decode_audio_size(audio_b64: str) -> int:
         raise ValueError("invalid base64 audio payload") from exc
 
 
-def to_upstream_payload(event: Any) -> str:
-    """Map a validated client event to its upstream JSON (audio untouched)."""
+def to_upstream_payload(event: Any) -> str | None:
+    """Map a validated client event to its upstream JSON (audio untouched).
+
+    Returns None for commit events: the translation session is continuous
+    and has no commit lifecycle, so commits are swallowed, never forwarded.
+    Language-config events never reach here; they are applied by
+    ``_apply_language_config`` before this mapping runs.
+    """
     if isinstance(event, (AudioAppendEvent, UpstreamAudioAppendEvent)):
         return json.dumps(
-            {"type": "input_audio_buffer.append", "audio": event.audio}
+            {"type": "session.input_audio_buffer.append", "audio": event.audio}
         )
-    return json.dumps({"type": "input_audio_buffer.commit"})
+    return None
 
 
 class RelaySession:
@@ -101,10 +112,13 @@ class RelaySession:
         self._upstream = upstream
         self._settings = settings
         self._limiter = AudioThroughputLimiter(settings.max_audio_bytes_per_second)
+        # Target language already applied upstream by the initial
+        # session.update sent at connect time. Repeat language-config
+        # events for the same language are skipped, never re-sent.
+        self._applied_target_language = settings.translation_target_language
         # Audio flow counters (metadata only, never payloads).
         self._audio_chunks = 0
         self._audio_bytes = 0
-        self._commits = 0
         self._upstream_events = 0
         self._session_start = time.monotonic()
         self._last_audio_log = self._session_start
@@ -130,11 +144,10 @@ class RelaySession:
             self._audio_bytes / self._audio_chunks if self._audio_chunks else 0.0
         )
         log.info(
-            "audio flow chunks=%d bytes=%d commits=%d "
+            "audio flow chunks=%d bytes=%d "
             "avg_chunk=%.0fB overall=%.0fB/s interval=%.0fB/s elapsed=%.1fs",
             self._audio_chunks,
             self._audio_bytes,
-            self._commits,
             avg_chunk,
             self._audio_bytes / total_elapsed,
             interval_rate,
@@ -147,12 +160,11 @@ class RelaySession:
     def _log_session_summary(self, reason: str) -> None:
         elapsed = time.monotonic() - self._session_start
         log.info(
-            "audio session ended reason=%s chunks=%d bytes=%d commits=%d "
+            "audio session ended reason=%s chunks=%d bytes=%d "
             "upstream_events=%d elapsed=%.1fs overall=%.0fB/s",
             reason,
             self._audio_chunks,
             self._audio_bytes,
-            self._commits,
             self._upstream_events,
             elapsed,
             self._audio_bytes / max(elapsed, 1e-6),
@@ -209,6 +221,40 @@ class RelaySession:
         except Exception:
             pass
 
+    async def _apply_language_config(
+        self, event: LanguageConfigEvent
+    ) -> str | None:
+        """Forward a target-language change upstream. Returns stop reason."""
+        if event.target_lang == self._applied_target_language:
+            log.debug(
+                "language unchanged target=%s", event.target_lang
+            )
+            return None
+        payload = build_session_update(
+            event.target_lang,
+            self._settings.translation_transcription_model,
+        )
+        try:
+            await asyncio.wait_for(
+                self._upstream.send_text(payload),
+                timeout=UPSTREAM_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            log.warning(
+                "upstream language update failed type=%s",
+                type(exc).__name__,
+            )
+            await self._send_client_error(
+                "upstream_error", "translation service unavailable"
+            )
+            return "upstream_send_failed"
+        self._applied_target_language = event.target_lang
+        log.info(
+            "translation target language updated target=%s",
+            event.target_lang,
+        )
+        return None
+
     async def _client_to_upstream(self) -> str:
         idle = self._settings.session_idle_timeout_seconds
         max_bytes = self._settings.max_websocket_message_bytes
@@ -263,6 +309,12 @@ class RelaySession:
                     continue
                 raise
 
+            if isinstance(event, LanguageConfigEvent):
+                stop = await self._apply_language_config(event)
+                if stop is not None:
+                    return stop
+                continue
+
             if isinstance(event, (AudioAppendEvent, UpstreamAudioAppendEvent)):
                 try:
                     size = decode_audio_size(event.audio)
@@ -302,13 +354,15 @@ class RelaySession:
                     )
                 self._log_audio_progress()
 
-            is_commit = event.type in (
-                "audio.commit",
-                "input_audio_buffer.commit",
-            )
+            payload = to_upstream_payload(event)
+            if payload is None:
+                # Translation sessions are continuous: client commits are
+                # accepted for extension compatibility but never forwarded.
+                log.debug("commit swallowed type=%s", event.type)
+                continue
             try:
                 await asyncio.wait_for(
-                    self._upstream.send_text(to_upstream_payload(event)),
+                    self._upstream.send_text(payload),
                     timeout=UPSTREAM_SEND_TIMEOUT_SECONDS,
                 )
             except Exception as exc:
@@ -316,19 +370,10 @@ class RelaySession:
                     "upstream send failed type=%s", type(exc).__name__
                 )
                 await self._send_client_error(
-                    "upstream_error", "transcription service unavailable"
+                    "upstream_error", "translation service unavailable"
                 )
                 return "upstream_send_failed"
-            if is_commit:
-                self._commits += 1
-                log.info(
-                    "audio commit #%d forwarded after chunks=%d bytes=%d",
-                    self._commits,
-                    self._audio_chunks,
-                    self._audio_bytes,
-                )
-            else:
-                log.debug("forwarded upstream type=%s", event.type)
+            log.debug("forwarded upstream type=%s", event.type)
 
     async def _upstream_to_client(self) -> str:
         while True:

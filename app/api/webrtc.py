@@ -96,7 +96,7 @@ async def webrtc_offer(payload: OfferRequest, request: Request):
     if not settings.openai_api_key:
         log.warning("webrtc offer rejected: OPENAI_API_KEY is not set")
         return _error(
-            503, "not_configured", "transcription service is not configured"
+            503, "not_configured", "translation service is not configured"
         )
 
     state = request.app.state
@@ -138,7 +138,7 @@ async def webrtc_offer(payload: OfferRequest, request: Request):
         except Exception:
             log.warning("webrtc upstream connect failed unexpectedly")
             raise _OfferFailure(
-                502, "upstream_error", "transcription service unavailable"
+                502, "upstream_error", "translation service unavailable"
             )
 
         pc = RTCPeerConnection()

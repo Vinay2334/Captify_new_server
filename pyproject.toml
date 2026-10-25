@@ -1,7 +1,7 @@
 [project]
 name = "captify-server"
 version = "0.1.0"
-description = "FastAPI WebSocket backend relaying tab audio to OpenAI Realtime transcription"
+description = "FastAPI WebSocket backend relaying tab audio to OpenAI Realtime translation"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

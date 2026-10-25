@@ -1,4 +1,4 @@
-"""WebSocket endpoint for real-time transcription.
+"""WebSocket endpoint for real-time translation.
 
 ``/api/v1/transcription/ws`` accepts unauthenticated connections (local
 development). This is NOT authentication: anyone who can reach the endpoint
@@ -30,6 +30,8 @@ def build_upstream_client(settings: Settings) -> OpenAIRealtimeClient:
         url=settings.openai_realtime_url,
         beta_header=settings.openai_beta_header,
         connect_timeout=settings.upstream_connect_timeout_seconds,
+        target_language=settings.translation_target_language,
+        transcription_model=settings.translation_transcription_model,
     )
 
 
@@ -89,7 +91,7 @@ async def _handle_session(websocket: WebSocket, settings: Settings) -> None:
                     {
                         "type": "error",
                         "code": "not_configured",
-                        "message": "transcription service is not configured",
+                        "message": "translation service is not configured",
                     }
                 )
             )
@@ -105,7 +107,7 @@ async def _handle_session(websocket: WebSocket, settings: Settings) -> None:
         await upstream.connect()
     except Exception as exc:
         code = getattr(exc, "code", "upstream_error")
-        message = getattr(exc, "message", "transcription service unavailable")
+        message = getattr(exc, "message", "translation service unavailable")
         try:
             await websocket.send_text(
                 json.dumps({"type": "error", "code": code, "message": message})
