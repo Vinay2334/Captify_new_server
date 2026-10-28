@@ -5,6 +5,10 @@ One instance per connected extension client. Opens
 (configurable), authenticates with the server-side API key, and configures a
 translation session (``gpt-realtime-translate`` by default).
 
+In transcription mode (``is_transcription=True``) it opens the
+transcription endpoint instead and configures a transcription session
+(``gpt-realtime-transcribe`` by default) with a commit / turn lifecycle.
+
 Wire contract verified against the official OpenAI Realtime translation
 guide and translation client/server event references
 (developers.openai.com, 2026):
@@ -57,6 +61,38 @@ def build_session_update(
     )
 
 
+def build_transcription_session_update(
+    model: str = "gpt-realtime-transcribe",
+    languages: list[str] | None = None,
+) -> str:
+    """Session configuration for transcription (continuous, 24 kHz PCM).
+
+    Transcription sessions have a commit / turn lifecycle: audio streams
+    with the ``input_audio_buffer.append`` event and each turn is closed
+    with ``input_audio_buffer.commit``. The transcript events map to the
+    same downstream ``transcript.delta`` / ``transcript.completed``
+    stream the extension renders for translations.
+    """
+    return json.dumps(
+        {
+            "type": "session.update",
+            "session": {
+                "type": "transcription",
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "transcription": {
+                            "model": model,
+                            "languages": list(languages) if languages else [],
+                        },
+                        "turn_detection": None,
+                    }
+                },
+            },
+        }
+    )
+
+
 class OpenAIRealtimeClient:
     """Dedicated upstream connection for one extension session."""
 
@@ -69,6 +105,8 @@ class OpenAIRealtimeClient:
         connect_timeout: float = 15.0,
         target_language: str = "en",
         transcription_model: str = "gpt-realtime-whisper",
+        is_transcription: bool = False,
+        transcription_languages: list[str] | None = None,
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -77,6 +115,8 @@ class OpenAIRealtimeClient:
         self._connect_timeout = connect_timeout
         self._target_language = target_language
         self._transcription_model = transcription_model
+        self._is_transcription = is_transcription
+        self._transcription_languages = list(transcription_languages or [])
         self._ws: Any = None
 
     @property
@@ -86,6 +126,21 @@ class OpenAIRealtimeClient:
     @property
     def target_language(self) -> str:
         return self._target_language
+
+    @property
+    def is_transcription(self) -> bool:
+        return self._is_transcription
+
+    def _session_update_for_mode(
+        self, target_language: str, transcription_model: str
+    ) -> str:
+        """Initial session.update for the active (translate/transcribe) mode."""
+        if self._is_transcription:
+            return build_transcription_session_update(
+                self._model,
+                self._transcription_languages or [target_language],
+            )
+        return build_session_update(target_language, transcription_model)
 
     async def connect(self) -> None:
         """Open the upstream socket and configure the session."""
@@ -127,7 +182,7 @@ class OpenAIRealtimeClient:
 
         try:
             await self._ws.send(
-                build_session_update(
+                self._session_update_for_mode(
                     self._target_language, self._transcription_model
                 )
             )

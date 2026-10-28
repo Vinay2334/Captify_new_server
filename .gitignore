@@ -11,3 +11,6 @@ wheels/
 
 # Secrets / local config
 .env
+
+# Debug audio recordings (raw user audio, never commit)
+recordings/

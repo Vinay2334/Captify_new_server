@@ -7,6 +7,8 @@ See ``.env.example`` for documented defaults.
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.schemas.events import is_same_language
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -31,6 +33,25 @@ class Settings(BaseSettings):
     translation_transcription_model: str = Field(
         default="gpt-realtime-whisper",
         alias="OPENAI_TRANSLATION_TRANSCRIPTION_MODEL",
+    )
+    # Deployment-wide mode switch: when True, every session transcribes
+    # (gpt-realtime-transcribe) instead of translating. Default False
+    # preserves the translation behavior.
+    transcribe_mode: bool = Field(default=True, alias="TRANSCRIBE_MODE")
+    # Source language for same-language detection. Empty means auto-detect
+    # (translation path). When it matches the target language, sessions
+    # transcribe instead of translating.
+    translation_source_language: str = Field(
+        default="", alias="OPENAI_TRANSLATION_SOURCE_LANGUAGE"
+    )
+    # Dedicated transcription model and endpoint for transcription
+    # sessions (global transcribe mode or same-language sessions).
+    openai_transcription_model: str = Field(
+        default="gpt-live-transcribe", alias="OPENAI_TRANSCRIPTION_MODEL"
+    )
+    openai_transcription_url: str = Field(
+        default="wss://api.openai.com/v1/realtime?intent=transcription",
+        alias="OPENAI_TRANSCRIPTION_URL",
     )
     openai_beta_header: str = Field(default="realtime=v1", alias="OPENAI_BETA_HEADER")
     upstream_connect_timeout_seconds: float = Field(
@@ -99,6 +120,29 @@ class Settings(BaseSettings):
         if origin is None:
             return True
         return origin in allowed
+
+    def starts_in_transcription(self) -> bool:
+        """Whether new sessions open on the transcription path.
+
+        True when the deployment-wide transcribe switch is on, or when
+        the configured source language matches the target (same-language
+        audio, which the translation model would omit).
+        """
+        return self.transcribe_mode or is_same_language(
+            self.translation_source_language, self.translation_target_language
+        )
+
+    def transcription_language_hint(self) -> list[str]:
+        """Spoken-language hint for the transcription session update."""
+        return [
+            self.translation_source_language or self.translation_target_language
+        ]
+
+    def active_model(self) -> str:
+        """Model reported to clients (session.ready / health)."""
+        if self.starts_in_transcription():
+            return self.openai_transcription_model
+        return self.openai_realtime_model
 
 
 settings = Settings()

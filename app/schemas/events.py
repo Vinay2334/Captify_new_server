@@ -36,8 +36,8 @@ class UpstreamAudioAppendEvent(BaseModel):
     """OpenAI-native audio chunk, accepted from the extension as-is.
 
     Both the legacy transcription name and the translation
-    ``session.``-prefixed name are accepted; both map to the translation
-    append event upstream.
+    ``session.``-prefixed name are accepted; the relay maps them to the
+    translation or transcription append event for the session mode.
     """
 
     type: Literal["input_audio_buffer.append", "session.input_audio_buffer.append"]
@@ -73,6 +73,26 @@ CLIENT_EVENT_TYPES = {
     "session.input_audio_buffer.commit",
     "language-config",
 }
+
+
+def normalize_language_code(code: str) -> str:
+    """Normalize a BCP-47 language tag for comparison."""
+    return code.strip().lower()
+
+
+def _primary_subtag(code: str) -> str:
+    """Primary language subtag (``en-US`` -> ``en``)."""
+    normalized = normalize_language_code(code)
+    for sep in ("-", "_"):
+        if sep in normalized:
+            return normalized.split(sep)[0]
+    return normalized
+
+
+def is_same_language(source: str, target: str) -> bool:
+    """Whether two language tags refer to the same spoken language."""
+    src, tgt = _primary_subtag(source), _primary_subtag(target)
+    return bool(src) and src == tgt
 
 
 def parse_client_event(data: dict[str, Any]) -> BaseModel:
@@ -133,11 +153,20 @@ class ErrorEvent(BaseModel):
 # so the downstream field stays empty.
 UPSTREAM_DELTA_TYPE = "session.output_transcript.delta"
 
+# Upstream transcription events (gpt-realtime-transcribe). They carry the
+# same spoken text the translation path would translate, so they map to
+# the same downstream ``transcript.delta`` / ``transcript.completed``
+# events the extension already renders.
+TRANSCRIPTION_DELTA_TYPE = "conversation.item.input_audio_transcription.delta"
+TRANSCRIPTION_COMPLETED_TYPE = (
+    "conversation.item.input_audio_transcription.completed"
+)
+
 # Upstream events that are expected but carry nothing for the extension.
 # They are consumed silently:
 # - session lifecycle (created / updated / closed),
-# - source-language ``session.input_transcript.delta`` (the downstream
-#   protocol carries a single translated caption stream),
+# - source-language ``session.input_transcript.delta`` (mapped only in
+#   transcription mode; ignored when translating),
 # - translated ``session.output_audio.delta`` (the downstream protocol is
 #   text-only; no audio is forwarded).
 UPSTREAM_IGNORED_TYPES = frozenset(
@@ -151,14 +180,36 @@ UPSTREAM_IGNORED_TYPES = frozenset(
 )
 
 
-def map_upstream_event(event: dict[str, Any]) -> BaseModel | None:
+def map_upstream_event(
+    event: dict[str, Any], transcription_mode: bool = False
+) -> BaseModel | None:
     """Map one upstream event to an extension event.
+
+    Transcription events map to the same downstream transcript events the
+    extension renders for translations, so the client protocol is unchanged.
+    ``session.input_transcript.delta`` additionally maps downstream only in
+    transcription mode; when translating it stays ignored.
 
     Returns None for events the extension does not need. Raises
     UpstreamError for upstream ``error`` events.
     """
     event_type = event.get("type")
     if event_type == UPSTREAM_DELTA_TYPE:
+        return TranscriptDeltaEvent(
+            delta=event.get("delta", ""),
+            item_id=event.get("item_id", ""),
+        )
+    if event_type == TRANSCRIPTION_DELTA_TYPE:
+        return TranscriptDeltaEvent(
+            delta=event.get("delta", ""),
+            item_id=event.get("item_id", ""),
+        )
+    if event_type == TRANSCRIPTION_COMPLETED_TYPE:
+        return TranscriptCompletedEvent(
+            transcript=event.get("transcript", ""),
+            item_id=event.get("item_id", ""),
+        )
+    if event_type == "session.input_transcript.delta" and transcription_mode:
         return TranscriptDeltaEvent(
             delta=event.get("delta", ""),
             item_id=event.get("item_id", ""),

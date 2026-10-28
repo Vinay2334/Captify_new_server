@@ -56,7 +56,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         return {
             "status": "ok",
             "active_sessions": app.state.active_sessions,
-            "model": resolved.openai_realtime_model,
+            "model": resolved.active_model(),
         }
 
     return app

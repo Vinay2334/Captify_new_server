@@ -24,6 +24,18 @@ router = APIRouter()
 
 
 def build_upstream_client(settings: Settings) -> OpenAIRealtimeClient:
+    if settings.starts_in_transcription():
+        return OpenAIRealtimeClient(
+            api_key=settings.openai_api_key,
+            model=settings.openai_transcription_model,
+            url=settings.openai_transcription_url,
+            beta_header=settings.openai_beta_header,
+            connect_timeout=settings.upstream_connect_timeout_seconds,
+            target_language=settings.translation_target_language,
+            transcription_model=settings.translation_transcription_model,
+            is_transcription=True,
+            transcription_languages=settings.transcription_language_hint(),
+        )
     return OpenAIRealtimeClient(
         api_key=settings.openai_api_key,
         model=settings.openai_realtime_model,
@@ -124,7 +136,7 @@ async def _handle_session(websocket: WebSocket, settings: Settings) -> None:
 
     try:
         await websocket.send_text(
-            SessionReadyEvent(model=settings.openai_realtime_model)
+            SessionReadyEvent(model=settings.active_model())
             .model_dump_json()
         )
     except Exception:

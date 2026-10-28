@@ -30,17 +30,23 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.schemas.events import (
     AudioAppendEvent,
+    AudioCommitEvent,
     ErrorEvent,
     LanguageConfigEvent,
     SessionReadyEvent,
     TranscriptCompletedEvent,
     TranscriptDeltaEvent,
     UpstreamAudioAppendEvent,
+    UpstreamAudioCommitEvent,
     UpstreamError,
     map_upstream_event,
+    is_same_language,
     parse_client_event,
 )
-from app.services.openai_realtime import build_session_update
+from app.services.openai_realtime import (
+    build_session_update,
+    build_transcription_session_update,
+)
 from app.services.relay import (
     UPSTREAM_SEND_TIMEOUT_SECONDS,
     AudioThroughputLimiter,
@@ -63,7 +69,16 @@ class DataChannel(Protocol):
     def send(self, message: bytes | str) -> None: ...
 
 
-def webrtc_audio_to_upstream_payload(raw: bytes) -> str:
+def _append_event_type(transcription_mode: bool) -> str:
+    """Upstream append event name for the session mode."""
+    if transcription_mode:
+        return "input_audio_buffer.append"
+    return "session.input_audio_buffer.append"
+
+
+def webrtc_audio_to_upstream_payload(
+    raw: bytes, transcription_mode: bool = False
+) -> str:
     """Validate one raw PCM16 DataChannel message and map it upstream.
 
     Returns the ``session.input_audio_buffer.append`` JSON payload with the
@@ -77,7 +92,7 @@ def webrtc_audio_to_upstream_payload(raw: bytes) -> str:
     except (binascii.Error, ValueError) as exc:
         raise ValueError("could not encode audio payload") from exc
     return json.dumps(
-        {"type": "session.input_audio_buffer.append", "audio": audio_b64}
+        {"type": _append_event_type(transcription_mode), "audio": audio_b64}
     )
 
 
@@ -107,6 +122,15 @@ class WebRTCRelaySession:
         self._audio_chunks = 0
         self._audio_bytes = 0
         self._upstream_events = 0
+        # Session mode: the deployment-wide transcribe switch, or a
+        # same-language session (the translation model omits same-language
+        # audio). Drives append/commit event names, session updates, and
+        # upstream transcript mapping below.
+        self._transcription_mode = settings.transcribe_mode or is_same_language(
+            settings.translation_source_language,
+            settings.translation_target_language,
+        )
+        self._transcription_languages = settings.transcription_language_hint()
         # Target language already applied upstream by the initial
         # session.update sent at connect time. Repeat language-config
         # events for the same language are skipped, never re-sent.
@@ -184,7 +208,7 @@ class WebRTCRelaySession:
         try:
             self._channel.send(
                 SessionReadyEvent(
-                    model=self._settings.openai_realtime_model
+                    model=self._settings.active_model()
                 ).model_dump_json()
             )
         except Exception:
@@ -237,7 +261,14 @@ class WebRTCRelaySession:
         self, event: LanguageConfigEvent
     ) -> str | None:
         """Forward a target-language change upstream. Returns stop reason."""
-        if event.target_lang == self._applied_target_language:
+        if self._settings.transcribe_mode or is_same_language(
+            event.source_lang, event.target_lang
+        ):
+            return await self._apply_transcription_config(event.source_lang)
+        if (
+            event.target_lang == self._applied_target_language
+            and not self._transcription_mode
+        ):
             log.debug("language unchanged target=%s", event.target_lang)
             return None
         payload = build_session_update(
@@ -247,11 +278,28 @@ class WebRTCRelaySession:
         ok = await self._forward_upstream(payload)
         if not ok:
             return "upstream_send_failed"
+        self._transcription_mode = False
         self._applied_target_language = event.target_lang
         log.info(
             "webrtc translation target language updated target=%s",
             event.target_lang,
         )
+        return None
+
+    async def _apply_transcription_config(self, source_lang: str) -> str | None:
+        """Forward a transcription language hint upstream. Returns stop reason."""
+        if self._transcription_mode and [source_lang] == self._transcription_languages:
+            log.debug("transcription language unchanged hint=%s", source_lang)
+            return None
+        payload = build_transcription_session_update(
+            self._settings.openai_transcription_model, [source_lang]
+        )
+        ok = await self._forward_upstream(payload)
+        if not ok:
+            return "upstream_send_failed"
+        self._transcription_mode = True
+        self._transcription_languages = [source_lang]
+        log.info("transcription language hint updated hint=%s", source_lang)
         return None
 
     async def _forward_upstream(self, payload: str) -> bool:
@@ -305,7 +353,7 @@ class WebRTCRelaySession:
             )
             return "message_too_large"
         try:
-            payload = webrtc_audio_to_upstream_payload(raw)
+            payload = webrtc_audio_to_upstream_payload(raw, self._transcription_mode)
         except ValueError:
             log.warning("webrtc audio chunk rejected: not Int16 PCM bytes")
             self._send_channel_error(
@@ -356,7 +404,7 @@ class WebRTCRelaySession:
                 return None
             payload = json.dumps(
                 {
-                    "type": "session.input_audio_buffer.append",
+                    "type": _append_event_type(self._transcription_mode),
                     "audio": event.audio,
                 }
             )
@@ -364,10 +412,25 @@ class WebRTCRelaySession:
             if not ok:
                 return "upstream_send_failed"
             return None
-        # Commit (audio.commit / input_audio_buffer.commit): accepted for
-        # extension compatibility but swallowed, never forwarded. The
-        # translation session is continuous and has no commit lifecycle.
-        log.debug("commit swallowed type=%s", event.type)
+        if isinstance(event, (AudioCommitEvent, UpstreamAudioCommitEvent)):
+            # Transcription sessions have a commit/turn lifecycle: commits
+            # close the turn and are forwarded. When translating, the
+            # session is continuous, so commits are swallowed here.
+            if not self._transcription_mode:
+                log.debug(
+                    "commit swallowed type=%s", event.type
+                )
+                return None
+            ok = await self._forward_upstream(
+                json.dumps({"type": "input_audio_buffer.commit"})
+            )
+            if not ok:
+                return "upstream_send_failed"
+            return None
+        # No other client event is expected here; ignore it defensively
+        # without upstream traffic and keep the session alive.
+        # (all known events are handled above).
+        log.debug("unexpected client event ignored type=%s", event.type)
         return None
 
     async def _channel_to_upstream(self) -> str:
@@ -414,7 +477,7 @@ class WebRTCRelaySession:
                 continue
             self._upstream_events += 1
             try:
-                mapped = map_upstream_event(event)
+                mapped = map_upstream_event(event, self._transcription_mode)
             except UpstreamError as exc:
                 log.warning("webrtc upstream error code=%s", exc.code)
                 self._send_channel_error(exc.code, exc.message)

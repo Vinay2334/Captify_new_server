@@ -5,8 +5,10 @@ Two concurrent tasks per connection, no queues, no full-recording buffer:
 - client -> upstream: validate each client event, enforce size / throughput
   limits, forward permitted audio events upstream (base64 payloads pass
   through untouched, never decoded and re-encoded). The translation
-  session is continuous, so client commit events are accepted (the
-  extension still sends them) but swallowed, never forwarded.
+  session is continuous, so in translation mode client commit events are
+  accepted (the extension still sends them) but swallowed, never
+  forwarded. In transcription mode commits close the turn and are
+  forwarded upstream.
 - upstream -> client: map supported translation transcript events
   downstream, drop everything else, convert upstream errors to safe
   client errors.
@@ -25,16 +27,22 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.schemas.events import (
     AudioAppendEvent,
+    AudioCommitEvent,
     ErrorEvent,
     LanguageConfigEvent,
     TranscriptCompletedEvent,
     TranscriptDeltaEvent,
     UpstreamAudioAppendEvent,
+    UpstreamAudioCommitEvent,
     UpstreamError,
     map_upstream_event,
+    is_same_language,
     parse_client_event,
 )
-from app.services.openai_realtime import build_session_update
+from app.services.openai_realtime import (
+    build_session_update,
+    build_transcription_session_update,
+)
 
 log = get_logger(__name__)
 
@@ -86,14 +94,30 @@ def decode_audio_size(audio_b64: str) -> int:
         raise ValueError("invalid base64 audio payload") from exc
 
 
-def to_upstream_payload(event: Any) -> str | None:
+def _transcription_payload(event: Any) -> str | None:
+    """Upstream JSON for transcription mode (commit/turn lifecycle)."""
+    if isinstance(event, (AudioAppendEvent, UpstreamAudioAppendEvent)):
+        return json.dumps(
+            {"type": "input_audio_buffer.append", "audio": event.audio}
+        )
+    if isinstance(event, (AudioCommitEvent, UpstreamAudioCommitEvent)):
+        return json.dumps({"type": "input_audio_buffer.commit"})
+    return None
+
+
+def to_upstream_payload(
+    event: Any, transcription_mode: bool = False
+) -> str | None:
     """Map a validated client event to its upstream JSON (audio untouched).
 
-    Returns None for commit events: the translation session is continuous
-    and has no commit lifecycle, so commits are swallowed, never forwarded.
+    In translation mode returns None for commit events (the translation
+    session is continuous, no commit lifecycle). In transcription mode
+    commits close the turn and use the commit-lifecycle event names.
     Language-config events never reach here; they are applied by
     ``_apply_language_config`` before this mapping runs.
     """
+    if transcription_mode:
+        return _transcription_payload(event)
     if isinstance(event, (AudioAppendEvent, UpstreamAudioAppendEvent)):
         return json.dumps(
             {"type": "session.input_audio_buffer.append", "audio": event.audio}
@@ -112,6 +136,15 @@ class RelaySession:
         self._upstream = upstream
         self._settings = settings
         self._limiter = AudioThroughputLimiter(settings.max_audio_bytes_per_second)
+        # Session mode: the deployment-wide transcribe switch, or a
+        # same-language session (the translation model omits same-language
+        # audio). Drives append/commit event names, session updates, and
+        # upstream transcript mapping below.
+        self._transcription_mode = settings.transcribe_mode or is_same_language(
+            settings.translation_source_language,
+            settings.translation_target_language,
+        )
+        self._transcription_languages = settings.transcription_language_hint()
         # Target language already applied upstream by the initial
         # session.update sent at connect time. Repeat language-config
         # events for the same language are skipped, never re-sent.
@@ -225,7 +258,14 @@ class RelaySession:
         self, event: LanguageConfigEvent
     ) -> str | None:
         """Forward a target-language change upstream. Returns stop reason."""
-        if event.target_lang == self._applied_target_language:
+        if self._settings.transcribe_mode or is_same_language(
+            event.source_lang, event.target_lang
+        ):
+            return await self._apply_transcription_config(event.source_lang)
+        if (
+            event.target_lang == self._applied_target_language
+            and not self._transcription_mode
+        ):
             log.debug(
                 "language unchanged target=%s", event.target_lang
             )
@@ -248,11 +288,39 @@ class RelaySession:
                 "upstream_error", "translation service unavailable"
             )
             return "upstream_send_failed"
+        self._transcription_mode = False
         self._applied_target_language = event.target_lang
         log.info(
             "translation target language updated target=%s",
             event.target_lang,
         )
+        return None
+
+    async def _apply_transcription_config(self, source_lang: str) -> str | None:
+        """Forward a transcription language hint upstream. Returns stop reason."""
+        if self._transcription_mode and [source_lang] == self._transcription_languages:
+            log.debug("transcription language unchanged hint=%s", source_lang)
+            return None
+        payload = build_transcription_session_update(
+            self._settings.openai_transcription_model, [source_lang]
+        )
+        try:
+            await asyncio.wait_for(
+                self._upstream.send_text(payload),
+                timeout=UPSTREAM_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            log.warning(
+                "upstream transcription update failed type=%s",
+                type(exc).__name__,
+            )
+            await self._send_client_error(
+                "upstream_error", "translation service unavailable"
+            )
+            return "upstream_send_failed"
+        self._transcription_mode = True
+        self._transcription_languages = [source_lang]
+        log.info("transcription language hint updated hint=%s", source_lang)
         return None
 
     async def _client_to_upstream(self) -> str:
@@ -354,7 +422,7 @@ class RelaySession:
                     )
                 self._log_audio_progress()
 
-            payload = to_upstream_payload(event)
+            payload = to_upstream_payload(event, self._transcription_mode)
             if payload is None:
                 # Translation sessions are continuous: client commits are
                 # accepted for extension compatibility but never forwarded.
@@ -390,7 +458,7 @@ class RelaySession:
                 continue
             self._upstream_events += 1
             try:
-                mapped = map_upstream_event(event)
+                mapped = map_upstream_event(event, self._transcription_mode)
             except UpstreamError as exc:
                 log.warning("upstream error code=%s", exc.code)
                 try:
