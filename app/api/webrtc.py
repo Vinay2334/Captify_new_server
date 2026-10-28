@@ -93,8 +93,8 @@ async def webrtc_offer(payload: OfferRequest, request: Request):
         log.warning("webrtc offer rejected: disallowed origin")
         return _error(403, "origin_not_allowed", "origin not allowed")
 
-    if not settings.openai_api_key:
-        log.warning("webrtc offer rejected: OPENAI_API_KEY is not set")
+    if not settings.upstream_api_key():
+        log.warning("webrtc offer rejected: translation API key is not set")
         return _error(
             503, "not_configured", "translation service is not configured"
         )

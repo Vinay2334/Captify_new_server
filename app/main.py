@@ -15,9 +15,9 @@ log = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not app.state.settings.openai_api_key:
+    if not app.state.settings.upstream_api_key():
         log.warning(
-            "OPENAI_API_KEY is not set: translation sessions will be "
+            "translation API key is not set: translation sessions will be "
             "rejected until it is configured"
         )
     log.warning(

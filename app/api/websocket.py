@@ -2,49 +2,31 @@
 
 ``/api/v1/transcription/ws`` accepts unauthenticated connections (local
 development). This is NOT authentication: anyone who can reach the endpoint
-can consume OpenAI API quota. Origin checks, message limits, idle timeouts,
+can consume API quota. Origin checks, message limits, idle timeouts,
 and connection caps are resource protections, not access control. Do not
 expose this endpoint publicly without added abuse protections.
 """
 
 import asyncio
 import json
+from typing import Any
 
 from fastapi import APIRouter, WebSocket
 
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.schemas.events import SessionReadyEvent
-from app.services.openai_realtime import OpenAIRealtimeClient
 from app.services.relay import RelaySession
+from app.services.stt_factory import STTWorkflowFactory
 
 log = get_logger(__name__)
 
 router = APIRouter()
 
 
-def build_upstream_client(settings: Settings) -> OpenAIRealtimeClient:
-    if settings.starts_in_transcription():
-        return OpenAIRealtimeClient(
-            api_key=settings.openai_api_key,
-            model=settings.openai_transcription_model,
-            url=settings.openai_transcription_url,
-            beta_header=settings.openai_beta_header,
-            connect_timeout=settings.upstream_connect_timeout_seconds,
-            target_language=settings.translation_target_language,
-            transcription_model=settings.translation_transcription_model,
-            is_transcription=True,
-            transcription_languages=settings.transcription_language_hint(),
-        )
-    return OpenAIRealtimeClient(
-        api_key=settings.openai_api_key,
-        model=settings.openai_realtime_model,
-        url=settings.openai_realtime_url,
-        beta_header=settings.openai_beta_header,
-        connect_timeout=settings.upstream_connect_timeout_seconds,
-        target_language=settings.translation_target_language,
-        transcription_model=settings.translation_transcription_model,
-    )
+def build_upstream_client(settings: Settings) -> Any:
+    """Build the upstream client for the configured ``STT_PROVIDER``."""
+    return STTWorkflowFactory.create_upstream_client(settings)
 
 
 @router.websocket("/api/v1/transcription/ws")
@@ -96,7 +78,7 @@ async def transcription_ws(websocket: WebSocket) -> None:
 
 
 async def _handle_session(websocket: WebSocket, settings: Settings) -> None:
-    if not settings.openai_api_key:
+    if not settings.upstream_api_key():
         try:
             await websocket.send_text(
                 json.dumps(
@@ -110,7 +92,7 @@ async def _handle_session(websocket: WebSocket, settings: Settings) -> None:
             await websocket.close(code=1011, reason="service not configured")
         except Exception:
             pass
-        log.warning("rejected connection: OPENAI_API_KEY is not set")
+        log.warning("rejected connection: translation API key is not set")
         return
 
     factory = websocket.app.state.upstream_factory

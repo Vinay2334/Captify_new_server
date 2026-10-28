@@ -39,6 +39,7 @@ from app.schemas.events import (
     is_same_language,
     parse_client_event,
 )
+from app.services.stt_factory import STTWorkflowFactory
 from app.services.openai_realtime import (
     build_session_update,
     build_transcription_session_update,
@@ -135,6 +136,7 @@ class RelaySession:
         self._client = client
         self._upstream = upstream
         self._settings = settings
+        self._workflow = STTWorkflowFactory.get_workflow(settings)
         self._limiter = AudioThroughputLimiter(settings.max_audio_bytes_per_second)
         # Session mode: the deployment-wide transcribe switch, or a
         # same-language session (the translation model omits same-language
@@ -258,6 +260,8 @@ class RelaySession:
         self, event: LanguageConfigEvent
     ) -> str | None:
         """Forward a target-language change upstream. Returns stop reason."""
+        if self._workflow.name == "soniox":
+            return self._apply_soniox_language_config(event)
         if self._settings.transcribe_mode or is_same_language(
             event.source_lang, event.target_lang
         ):
@@ -298,6 +302,8 @@ class RelaySession:
 
     async def _apply_transcription_config(self, source_lang: str) -> str | None:
         """Forward a transcription language hint upstream. Returns stop reason."""
+        if self._workflow.name == "soniox":
+            return self._apply_soniox_transcription_config(source_lang)
         if self._transcription_mode and [source_lang] == self._transcription_languages:
             log.debug("transcription language unchanged hint=%s", source_lang)
             return None
@@ -318,6 +324,37 @@ class RelaySession:
                 "upstream_error", "translation service unavailable"
             )
             return "upstream_send_failed"
+        self._transcription_mode = True
+        self._transcription_languages = [source_lang]
+        log.info("transcription language hint updated hint=%s", source_lang)
+        return None
+
+    def _apply_soniox_language_config(self, event: LanguageConfigEvent) -> str | None:
+        """Track target switches for Soniox (target is fixed at connect).
+
+        A Soniox translation session already carries the original tokens
+        alongside the translated ones, so switching modes only flips the
+        local emission filter: no upstream send is needed.
+        """
+        if self._settings.transcribe_mode or is_same_language(
+            event.source_lang, event.target_lang
+        ):
+            self._transcription_mode = True
+            self._transcription_languages = [event.source_lang]
+            log.info(
+                "transcription language hint updated hint=%s", event.source_lang
+            )
+        else:
+            self._transcription_mode = False
+            self._applied_target_language = event.target_lang
+            log.info(
+                "translation target language updated target=%s",
+                event.target_lang,
+            )
+        return None
+
+    def _apply_soniox_transcription_config(self, source_lang: str) -> str | None:
+        """Track transcription hints for Soniox (fixed at connect)."""
         self._transcription_mode = True
         self._transcription_languages = [source_lang]
         log.info("transcription language hint updated hint=%s", source_lang)
@@ -422,7 +459,7 @@ class RelaySession:
                     )
                 self._log_audio_progress()
 
-            payload = to_upstream_payload(event, self._transcription_mode)
+            payload = self._workflow.to_upstream_payload(event, self._transcription_mode)
             if payload is None:
                 # Translation sessions are continuous: client commits are
                 # accepted for extension compatibility but never forwarded.
@@ -458,7 +495,7 @@ class RelaySession:
                 continue
             self._upstream_events += 1
             try:
-                mapped = map_upstream_event(event, self._transcription_mode)
+                mapped = self._workflow.map_upstream_event(event, self._transcription_mode)
             except UpstreamError as exc:
                 log.warning("upstream error code=%s", exc.code)
                 try:

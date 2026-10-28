@@ -9,9 +9,31 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.schemas.events import is_same_language
 
+# Valid values for the global STT provider switch (``STT_PROVIDER``).
+STT_PROVIDERS = ("openai", "soniox")
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # Global STT provider switch. "openai" preserves the existing OpenAI
+    # Realtime workflow; "soniox" routes sessions through Soniox stt-rt-v5.
+    stt_provider: str = Field(default="soniox", alias="STT_PROVIDER")
+
+    # Soniox Realtime API (server side only - never sent to the extension).
+    soniox_api_key: str = Field(default="", alias="SONIOX_API_KEY")
+    soniox_model: str = Field(default="stt-rt-v5", alias="SONIOX_MODEL")
+    soniox_url: str = Field(
+        default="wss://stt-rt.soniox.com/transcribe-websocket",
+        alias="SONIOX_URL",
+    )
+    # Extension audio is mono PCM16 @ 24 kHz; Soniox accepts this rate
+    # natively, so no resampling is needed.
+    soniox_sample_rate: int = Field(default=24000, alias="SONIOX_SAMPLE_RATE")
+    soniox_num_channels: int = Field(default=1, alias="SONIOX_NUM_CHANNELS")
+    soniox_enable_endpoint_detection: bool = Field(
+        default=True, alias="SONIOX_ENABLE_ENDPOINT_DETECTION"
+    )
 
     # OpenAI Realtime API (server side only - never sent to the extension).
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
@@ -88,6 +110,13 @@ class Settings(BaseSettings):
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    @field_validator("stt_provider")
+    @classmethod
+    def _provider_supported(cls, value: str) -> str:
+        if value not in STT_PROVIDERS:
+            raise ValueError(f"must be one of {STT_PROVIDERS}")
+        return value
+
     @field_validator(
         "max_websocket_message_bytes",
         "max_concurrent_sessions",
@@ -121,6 +150,16 @@ class Settings(BaseSettings):
             return True
         return origin in allowed
 
+    def is_soniox_provider(self) -> bool:
+        """Whether sessions route through Soniox instead of OpenAI."""
+        return self.stt_provider == "soniox"
+
+    def upstream_api_key(self) -> str:
+        """API key for the active provider (never sent to the extension)."""
+        if self.is_soniox_provider():
+            return self.soniox_api_key
+        return self.openai_api_key
+
     def starts_in_transcription(self) -> bool:
         """Whether new sessions open on the transcription path.
 
@@ -138,8 +177,21 @@ class Settings(BaseSettings):
             self.translation_source_language or self.translation_target_language
         ]
 
+    def soniox_language_hints(self) -> list[str]:
+        """Spoken-language hints for the Soniox session config."""
+        hints: list[str] = []
+        for code in (
+            self.translation_source_language,
+            self.translation_target_language,
+        ):
+            if code and code not in hints:
+                hints.append(code)
+        return hints or [self.translation_target_language]
+
     def active_model(self) -> str:
         """Model reported to clients (session.ready / health)."""
+        if self.is_soniox_provider():
+            return self.soniox_model
         if self.starts_in_transcription():
             return self.openai_transcription_model
         return self.openai_realtime_model

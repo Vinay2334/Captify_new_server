@@ -43,6 +43,7 @@ from app.schemas.events import (
     is_same_language,
     parse_client_event,
 )
+from app.services.stt_factory import STTWorkflowFactory
 from app.services.openai_realtime import (
     build_session_update,
     build_transcription_session_update,
@@ -115,6 +116,7 @@ class WebRTCRelaySession:
         self._channel = channel
         self._upstream = upstream
         self._settings = settings
+        self._workflow = STTWorkflowFactory.get_workflow(settings)
         self._limiter = AudioThroughputLimiter(settings.max_audio_bytes_per_second)
         self._queue: asyncio.Queue = asyncio.Queue()
         # Test hook: lets tests observe raw channel traffic if needed.
@@ -261,6 +263,8 @@ class WebRTCRelaySession:
         self, event: LanguageConfigEvent
     ) -> str | None:
         """Forward a target-language change upstream. Returns stop reason."""
+        if self._workflow.name == "soniox":
+            return self._apply_soniox_language_config(event)
         if self._settings.transcribe_mode or is_same_language(
             event.source_lang, event.target_lang
         ):
@@ -288,6 +292,8 @@ class WebRTCRelaySession:
 
     async def _apply_transcription_config(self, source_lang: str) -> str | None:
         """Forward a transcription language hint upstream. Returns stop reason."""
+        if self._workflow.name == "soniox":
+            return self._apply_soniox_transcription_config(source_lang)
         if self._transcription_mode and [source_lang] == self._transcription_languages:
             log.debug("transcription language unchanged hint=%s", source_lang)
             return None
@@ -297,6 +303,30 @@ class WebRTCRelaySession:
         ok = await self._forward_upstream(payload)
         if not ok:
             return "upstream_send_failed"
+        self._transcription_mode = True
+        self._transcription_languages = [source_lang]
+        log.info("transcription language hint updated hint=%s", source_lang)
+        return None
+
+    def _apply_soniox_language_config(self, event: LanguageConfigEvent) -> str | None:
+        """Track target switches for Soniox (target is fixed at connect)."""
+        if self._settings.transcribe_mode or is_same_language(
+            event.source_lang, event.target_lang
+        ):
+            self._transcription_mode = True
+            self._transcription_languages = [event.source_lang]
+            log.info("transcription language hint updated hint=%s", event.source_lang)
+        else:
+            self._transcription_mode = False
+            self._applied_target_language = event.target_lang
+            log.info(
+                "webrtc translation target language updated target=%s",
+                event.target_lang,
+            )
+        return None
+
+    def _apply_soniox_transcription_config(self, source_lang: str) -> str | None:
+        """Track transcription hints for Soniox (fixed at connect)."""
         self._transcription_mode = True
         self._transcription_languages = [source_lang]
         log.info("transcription language hint updated hint=%s", source_lang)
@@ -353,7 +383,7 @@ class WebRTCRelaySession:
             )
             return "message_too_large"
         try:
-            payload = webrtc_audio_to_upstream_payload(raw, self._transcription_mode)
+            payload = self._workflow.webrtc_audio_payload(raw, self._transcription_mode)
         except ValueError:
             log.warning("webrtc audio chunk rejected: not Int16 PCM bytes")
             self._send_channel_error(
@@ -402,7 +432,10 @@ class WebRTCRelaySession:
                 return None
             if not self._count_audio_bytes(size, source="base64"):
                 return None
-            payload = json.dumps(
+            # Provider audio payload: OpenAI JSON append, or a Soniox base64
+            # text frame. The json.dumps fallback only applies if a workflow
+            # ever returns None for an append (commits never reach here).
+            payload = self._workflow.to_upstream_payload(event, self._transcription_mode) or json.dumps(
                 {
                     "type": _append_event_type(self._transcription_mode),
                     "audio": event.audio,
@@ -416,6 +449,11 @@ class WebRTCRelaySession:
             # Transcription sessions have a commit/turn lifecycle: commits
             # close the turn and are forwarded. When translating, the
             # session is continuous, so commits are swallowed here.
+            if self._workflow.name == "soniox":
+                # Soniox has no commit lifecycle; the stream ends when the
+                # channel closes, so commits are always swallowed.
+                log.debug("commit swallowed type=%s", event.type)
+                return None
             if not self._transcription_mode:
                 log.debug(
                     "commit swallowed type=%s", event.type
@@ -477,7 +515,7 @@ class WebRTCRelaySession:
                 continue
             self._upstream_events += 1
             try:
-                mapped = map_upstream_event(event, self._transcription_mode)
+                mapped = self._workflow.map_upstream_event(event, self._transcription_mode)
             except UpstreamError as exc:
                 log.warning("webrtc upstream error code=%s", exc.code)
                 self._send_channel_error(exc.code, exc.message)
