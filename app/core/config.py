@@ -12,6 +12,13 @@ from app.schemas.events import is_same_language
 # Valid values for the global STT provider switch (``STT_PROVIDER``).
 STT_PROVIDERS = ("openai", "soniox")
 
+# Valid values for the subtitle (text2text translation) provider switch
+# (``SUBTITLE_PROVIDER``). ``"none"`` disables post-transcription
+# translation; ``"deepseek"`` translates live-transcribe transcripts with
+# a DeepSeek chat model (default ``deepseek-flash``) over the existing
+# ``httpx`` dependency (OpenAI-compatible ``/chat/completions``).
+SUBTITLE_PROVIDERS = ("none", "deepseek")
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -64,7 +71,7 @@ class Settings(BaseSettings):
     # (translation path). When it matches the target language, sessions
     # transcribe instead of translating.
     translation_source_language: str = Field(
-        default="", alias="OPENAI_TRANSLATION_SOURCE_LANGUAGE"
+        default="en", alias="OPENAI_TRANSLATION_SOURCE_LANGUAGE"
     )
     # Dedicated transcription model and endpoint for transcription
     # sessions (global transcribe mode or same-language sessions).
@@ -78,6 +85,36 @@ class Settings(BaseSettings):
     openai_beta_header: str = Field(default="realtime=v1", alias="OPENAI_BETA_HEADER")
     upstream_connect_timeout_seconds: float = Field(
         default=15.0, alias="UPSTREAM_CONNECT_TIMEOUT_SECONDS"
+    )
+
+    # Subtitle (text2text translation) provider switch. "none" (default)
+    # keeps transcription transcripts untranslated; "deepseek" translates
+    # each live-transcribe transcript segment into the session target
+    # language with a rolling window of previous segments as context.
+    subtitle_provider: str = Field(default="none", alias="SUBTITLE_PROVIDER")
+    # Model id sent to the DeepSeek chat API (OpenAI-compatible).
+    subtitle_model: str = Field(default="deepseek-flash", alias="SUBTITLE_MODEL")
+    deepseek_api_key: str = Field(default="", alias="DEEPSEEK_API_KEY")
+    deepseek_base_url: str = Field(
+        default="https://api.deepseek.com", alias="DEEPSEEK_BASE_URL"
+    )
+    # Rolling-window size: how many previous source/translation segment
+    # pairs are sent as context alongside the segment being translated.
+    subtitle_context_segments: int = Field(
+        default=3, alias="SUBTITLE_CONTEXT_SEGMENTS"
+    )
+    subtitle_timeout_seconds: float = Field(
+        default=15.0, alias="SUBTITLE_TIMEOUT_SECONDS"
+    )
+
+    subtitle_min_segment_chars: int = Field(
+        default=20, alias="SUBTITLE_MIN_SEGMENT_CHARS"
+    )
+    subtitle_max_segment_chars: int = Field(
+        default=300, alias="SUBTITLE_MAX_SEGMENT_CHARS"
+    )
+    subtitle_flush_seconds: float = Field(
+        default=2.0, alias="SUBTITLE_FLUSH_SECONDS"
     )
 
     # Client-facing WebSocket limits.
@@ -117,6 +154,13 @@ class Settings(BaseSettings):
             raise ValueError(f"must be one of {STT_PROVIDERS}")
         return value
 
+    @field_validator("subtitle_provider")
+    @classmethod
+    def _subtitle_provider_supported(cls, value: str) -> str:
+        if value not in SUBTITLE_PROVIDERS:
+            raise ValueError(f"must be one of {SUBTITLE_PROVIDERS}")
+        return value
+
     @field_validator(
         "max_websocket_message_bytes",
         "max_concurrent_sessions",
@@ -128,12 +172,43 @@ class Settings(BaseSettings):
             raise ValueError("must be positive")
         return value
 
+    @field_validator("subtitle_context_segments")
+    @classmethod
+    def _non_negative_segments(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must be zero or positive")
+        return value
+
     @field_validator("session_idle_timeout_seconds")
     @classmethod
     def _positive_float(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("must be positive")
         return value
+
+    @field_validator("subtitle_min_segment_chars")
+    @classmethod
+    def _non_negative_subtitle_chars(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must be zero or positive")
+        return value
+
+    @field_validator("subtitle_max_segment_chars")
+    @classmethod
+    def _non_negative_subtitle_max(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must be zero or positive")
+        return value
+
+    @field_validator("subtitle_flush_seconds")
+    @classmethod
+    def _positive_subtitle_float(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("must be positive")
+        return value
+
+    def subtitle_enabled(self) -> bool:
+        return self.subtitle_provider != "none"
 
     def allowed_origins(self) -> list[str]:
         raw = self.allowed_websocket_origins.strip()

@@ -40,6 +40,7 @@ from app.schemas.events import (
     parse_client_event,
 )
 from app.services.stt_factory import STTWorkflowFactory
+from app.services.subtitle_factory import SubtitleError, SubtitleFactory
 from app.services.openai_realtime import (
     build_session_update,
     build_transcription_session_update,
@@ -132,11 +133,15 @@ class RelaySession:
         client: ClientSocket,
         upstream: UpstreamSocket,
         settings: Settings,
+        subtitle: Any | None = None,
     ) -> None:
         self._client = client
         self._upstream = upstream
         self._settings = settings
         self._workflow = STTWorkflowFactory.get_workflow(settings)
+        self._subtitle = subtitle or SubtitleFactory.get_translator(settings)
+        self._subtitle_target_language = settings.translation_target_language
+        self._subtitle_source = settings.translation_source_language or None
         self._limiter = AudioThroughputLimiter(settings.max_audio_bytes_per_second)
         # Session mode: the deployment-wide transcribe switch, or a
         # same-language session (the translation model omits same-language
@@ -240,7 +245,6 @@ class RelaySession:
                     task.cancel()
             await asyncio.gather(c2u, u2c, return_exceptions=True)
             await self._close_both()
-
     async def _close_both(self) -> None:
         for sock in (self._client, self._upstream):
             try:
@@ -260,6 +264,8 @@ class RelaySession:
         self, event: LanguageConfigEvent
     ) -> str | None:
         """Forward a target-language change upstream. Returns stop reason."""
+        self._update_subtitle_target(event.target_lang)
+        self._subtitle_source = event.source_lang or self._subtitle_source
         if self._workflow.name == "soniox":
             return self._apply_soniox_language_config(event)
         if self._settings.transcribe_mode or is_same_language(
@@ -300,6 +306,90 @@ class RelaySession:
         )
         return None
 
+    def _update_subtitle_target(self, target_language: str) -> None:
+        if target_language != self._subtitle_target_language:
+            self._subtitle_target_language = target_language
+            try:
+                self._subtitle.clear_history()
+            except Exception:
+                pass
+
+    def _subtitle_source_language(self) -> str | None:
+        return self._subtitle_source
+
+    async def _maybe_translate_subtitle(self, mapped: Any) -> Any:
+        if not self._transcription_mode:
+            return mapped
+        if not getattr(self._subtitle, "enabled", False):
+            return mapped
+        if isinstance(mapped, TranscriptDeltaEvent):
+            text, store, field = mapped.delta, False, "delta"
+        elif isinstance(mapped, TranscriptCompletedEvent):
+            text, store, field = mapped.transcript, True, "transcript"
+        else:
+            return mapped
+        if not text or not text.strip():
+            return mapped
+        source = self._subtitle_source_language()
+        target = self._subtitle_target_language
+        if source and is_same_language(source, target):
+            return mapped
+        streamed: list[str] = []
+
+        async def _emit_piece(piece: str) -> None:
+            if not piece:
+                return
+            # Each translated sentence starts on a new line so consecutive
+            # captions don't run together on the client.
+            if not streamed and not piece.startswith("\n"):
+                piece = "\n" + piece
+            streamed.append(piece)
+            try:
+                await self._client.send_text(
+                    TranscriptDeltaEvent(
+                        delta=piece, item_id=mapped.item_id
+                    ).model_dump_json()
+                )
+            except Exception:
+                pass
+
+        try:
+            translated = await self._subtitle.translate(
+                text,
+                target_language=target,
+                source_language=source,
+                store=store,
+                item_id=mapped.item_id,
+                on_chunk=_emit_piece,
+            )
+        except SubtitleError as exc:
+            log.warning("subtitle translation skipped code=%s", exc.code)
+            return mapped
+        except Exception as exc:
+            log.warning(
+                "subtitle translation failed type=%s", type(exc).__name__
+            )
+            return mapped
+        if translated is None:
+            return None
+        if not translated.strip():
+            return mapped
+        log.debug(
+            "subtitle translated chars=%d->%d store=%s streamed=%d",
+            len(text),
+            len(translated),
+            store,
+            len(streamed),
+        )
+        if not translated.startswith("\n"):
+            translated = "\n" + translated
+        if field == "delta":
+            if streamed:
+                return None
+            return TranscriptDeltaEvent(delta=translated, item_id=mapped.item_id)
+        return TranscriptCompletedEvent(
+            transcript=translated, item_id=mapped.item_id
+        )
     async def _apply_transcription_config(self, source_lang: str) -> str | None:
         """Forward a transcription language hint upstream. Returns stop reason."""
         if self._workflow.name == "soniox":
@@ -387,7 +477,6 @@ class RelaySession:
                 except Exception:
                     pass
                 return "message_too_large"
-
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
@@ -509,6 +598,9 @@ class RelaySession:
                 log.debug(
                     "upstream event ignored type=%s", event.get("type")
                 )
+                continue
+            mapped = await self._maybe_translate_subtitle(mapped)
+            if mapped is None:
                 continue
             if isinstance(mapped, TranscriptDeltaEvent):
                 log.info(

@@ -34,6 +34,7 @@ def make_settings(**overrides):
         "MAX_WEBSOCKET_MESSAGE_BYTES": 65536,
     }
     base.update(overrides)
+    base.setdefault("SUBTITLE_PROVIDER", "none")
     return Settings(**base)
 
 
@@ -336,6 +337,7 @@ async def test_channel_send_failure_ends_session():
 def make_client(**overrides):
     base = {"OPENAI_API_KEY": "test-key"}
     base.update(overrides)
+    base.setdefault("SUBTITLE_PROVIDER", "none")
     return TestClient(create_app(Settings(**base)))
 
 

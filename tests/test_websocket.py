@@ -61,6 +61,7 @@ class FakeUpstream:
 def make_client(**overrides):
     base = {"OPENAI_API_KEY": "test-key-fake-12345"}
     base.update(overrides)
+    base.setdefault("SUBTITLE_PROVIDER", "none")
     settings = Settings(**base)
     fakes: list[FakeUpstream] = []
     connect_error = overrides.pop("_connect_error", None) if "_connect_error" in overrides else None

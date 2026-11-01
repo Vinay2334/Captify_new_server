@@ -44,6 +44,7 @@ from app.schemas.events import (
     parse_client_event,
 )
 from app.services.stt_factory import STTWorkflowFactory
+from app.services.subtitle_factory import SubtitleError, SubtitleFactory
 from app.services.openai_realtime import (
     build_session_update,
     build_transcription_session_update,
@@ -112,11 +113,15 @@ class WebRTCRelaySession:
         upstream: Any,
         settings: Settings,
         on_message: Callable[[bytes | str], None] | None = None,
+        subtitle: Any | None = None,
     ) -> None:
         self._channel = channel
         self._upstream = upstream
         self._settings = settings
         self._workflow = STTWorkflowFactory.get_workflow(settings)
+        self._subtitle = subtitle or SubtitleFactory.get_translator(settings)
+        self._subtitle_target_language = settings.translation_target_language
+        self._subtitle_source = settings.translation_source_language or None
         self._limiter = AudioThroughputLimiter(settings.max_audio_bytes_per_second)
         self._queue: asyncio.Queue = asyncio.Queue()
         # Test hook: lets tests observe raw channel traffic if needed.
@@ -263,6 +268,8 @@ class WebRTCRelaySession:
         self, event: LanguageConfigEvent
     ) -> str | None:
         """Forward a target-language change upstream. Returns stop reason."""
+        self._update_subtitle_target(event.target_lang)
+        self._subtitle_source = event.source_lang or self._subtitle_source
         if self._workflow.name == "soniox":
             return self._apply_soniox_language_config(event)
         if self._settings.transcribe_mode or is_same_language(
@@ -289,6 +296,84 @@ class WebRTCRelaySession:
             event.target_lang,
         )
         return None
+
+    def _update_subtitle_target(self, target_language: str) -> None:
+        if target_language != self._subtitle_target_language:
+            self._subtitle_target_language = target_language
+            try:
+                self._subtitle.clear_history()
+            except Exception:
+                pass
+
+    def _subtitle_source_language(self) -> str | None:
+        return self._subtitle_source
+
+    async def _maybe_translate_subtitle(self, mapped: Any) -> Any:
+        if not self._transcription_mode:
+            return mapped
+        if not getattr(self._subtitle, "enabled", False):
+            return mapped
+        if isinstance(mapped, TranscriptDeltaEvent):
+            text, store = mapped.delta, False
+        elif isinstance(mapped, TranscriptCompletedEvent):
+            text, store = mapped.transcript, True
+        else:
+            return mapped
+        if not text or not text.strip():
+            return mapped
+        source = self._subtitle_source_language()
+        target = self._subtitle_target_language
+        streamed: list[str] = []
+
+        async def _emit_piece(piece: str) -> None:
+            if not piece:
+                return
+            # Each translated sentence starts on a new line so consecutive
+            # captions do not run together on the client.
+            if not streamed and not piece.startswith("\n"):
+                piece = "\n" + piece
+            streamed.append(piece)
+            try:
+                print("Emitting translated piece:", piece)
+                self._channel.send(
+                    TranscriptDeltaEvent(
+                        delta=piece, item_id=mapped.item_id
+                    ).model_dump_json()
+                )
+            except Exception:
+                pass
+        if source and is_same_language(source, target):
+            return mapped
+        try:
+            translated = await self._subtitle.translate(
+                text,
+                target_language=target,
+                source_language=source,
+                store=store,
+                on_chunk=_emit_piece,
+                item_id=mapped.item_id,
+            )
+        except SubtitleError as exc:
+            log.warning("webrtc subtitle translation skipped code=%s", exc.code)
+            return mapped
+        except Exception as exc:
+            log.warning(
+                "webrtc subtitle translation failed type=%s", type(exc).__name__
+            )
+            return mapped
+        if translated is None:
+            return None
+        if not translated.strip():
+            return mapped
+        if not translated.startswith("\n"):
+            translated = "\n" + translated
+        if isinstance(mapped, TranscriptDeltaEvent):
+            if streamed:
+                return None
+            return TranscriptDeltaEvent(delta=translated, item_id=mapped.item_id)
+        return TranscriptCompletedEvent(
+            transcript=translated, item_id=mapped.item_id
+        )
 
     async def _apply_transcription_config(self, source_lang: str) -> str | None:
         """Forward a transcription language hint upstream. Returns stop reason."""
@@ -520,6 +605,9 @@ class WebRTCRelaySession:
                 log.warning("webrtc upstream error code=%s", exc.code)
                 self._send_channel_error(exc.code, exc.message)
                 return f"upstream_error:{exc.code}"
+            if mapped is None:
+                continue
+            mapped = await self._maybe_translate_subtitle(mapped)
             if mapped is None:
                 continue
             if isinstance(mapped, TranscriptDeltaEvent):

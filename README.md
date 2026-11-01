@@ -46,6 +46,21 @@ Two client transports are supported; both feed the same upstream session.
 - The backend forwards translated transcript deltas
   (`session.output_transcript.delta` → `transcript.delta`). Translation
   emits deltas only, so `transcript.completed` never fires.
+- Subtitle translation: set `SUBTITLE_PROVIDER=deepseek` (plus
+  `DEEPSEEK_API_KEY`) to translate `openai-live-transcribe` transcripts
+  into the session target language with the `deepseek-flash` chat model
+  (`SUBTITLE_MODEL`). The last `SUBTITLE_CONTEXT_SEGMENTS` (default 3)
+  segments travel as context so pronouns and topic stay consistent; only
+  the current segment is translated. Transcription deltas arrive word by
+  word, so fragments are buffered per turn and DeepSeek is only called for
+  flush-ready segments (sentence end, `SUBTITLE_MAX_SEGMENT_CHARS` cap, or
+  `SUBTITLE_FLUSH_SECONDS` age with `SUBTITLE_MIN_SEGMENT_CHARS` minimum).
+  Applies to transcription-mode
+  transcripts on both transports; failures fall back to the original text.
+  Sentences stream token-by-token as `transcript.delta` events while
+  DeepSeek responds, then land as `transcript.completed`; committed
+  sentences are never re-translated. Each translated sentence starts
+  with a newline so consecutive captions don't run together.
 - Source-language deltas and translated audio (`session.output_audio.delta`)
   are dropped: the downstream protocol is translated-text-only.
 - Client `audio.commit` events are accepted (the extension still sends

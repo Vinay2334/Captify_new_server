@@ -24,6 +24,7 @@ from app.services.openai_realtime import build_session_update
 def make_settings(**overrides):
     base = {"OPENAI_API_KEY": "test-key"}
     base.update(overrides)
+    base.setdefault("SUBTITLE_PROVIDER", "none")
     return Settings(**base)
 
 

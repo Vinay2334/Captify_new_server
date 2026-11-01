@@ -43,6 +43,7 @@ def make_settings(**overrides):
         "MAX_WEBSOCKET_MESSAGE_BYTES": 65536,
     }
     base.update(overrides)
+    base.setdefault("SUBTITLE_PROVIDER", "none")
     return Settings(**base)
 
 
