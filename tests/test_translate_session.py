@@ -142,3 +142,38 @@ def test_parse_client_event_rejects_language_config_without_target():
         parse_client_event(
             {"type": "language-config", "source_lang": "hi"}
         )
+
+
+async def test_openai_connect_tls_failure_maps_to_tls_error(monkeypatch):
+    import ssl
+    import sys
+    import types
+
+    from app.services.openai_realtime import OpenAIRealtimeClient
+
+    async def _fail_tls(*args, **kwargs):
+        raise ssl.SSLCertVerificationError(
+            "certificate verify failed: unable to get local issuer "
+            "certificate"
+        )
+
+    fake_ws = types.ModuleType("websockets")
+    fake_ws.connect = _fail_tls  # type: ignore[attr-defined]
+    fake_exc = types.ModuleType("websockets.exceptions")
+
+    class InvalidStatus(Exception):
+        pass
+
+    fake_exc.InvalidStatus = InvalidStatus  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "websockets", fake_ws)
+    monkeypatch.setitem(sys.modules, "websockets.exceptions", fake_exc)
+
+    client = OpenAIRealtimeClient(
+        api_key="test-key",
+        model="gpt-realtime-translate",
+        url="wss://api.openai.com/v1/realtime/translations"
+        "?model=gpt-realtime-translate",
+    )
+    with pytest.raises(UpstreamError) as excinfo:
+        await client.connect()
+    assert excinfo.value.code == "tls_error"

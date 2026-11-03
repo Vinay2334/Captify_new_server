@@ -196,6 +196,7 @@ async def webrtc_offer(payload: OfferRequest, request: Request):
         log.info("webrtc offer answered; session starting")
         return {"sdp": local.sdp, "type": local.type}
     except _OfferFailure as failure:
+        print(f"webrtc offer failed: {failure.status} {failure.code} {failure.message}")
         async with state.slot_lock:
             state.active_sessions = max(0, state.active_sessions - 1)
         return _error(failure.status, failure.code, failure.message)

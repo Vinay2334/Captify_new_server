@@ -25,12 +25,31 @@ There is no commit / turn lifecycle: translation streams continuously.
 
 import asyncio
 import json
+import ssl
 from typing import Any
 
 from app.core.logging import get_logger
 from app.schemas.events import UpstreamError
 
 log = get_logger(__name__)
+
+
+def _tls_context() -> ssl.SSLContext:
+    """TLS context for the upstream socket.
+
+    System CAs plus the certifi bundle (already installed via httpx),
+    so slim containers without system CA certificates still verify.
+    Still honors SSL_CERT_FILE / SSL_CERT_DIR through the default
+    context for proxies with a custom CA.
+    """
+    context = ssl.create_default_context()
+    try:
+        import certifi
+
+        context.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass
+    return context
 
 
 def build_session_update(
@@ -150,12 +169,14 @@ class OpenAIRealtimeClient:
         headers = {
             "Authorization": f"Bearer {self._api_key}",
         }
+        tls = _tls_context()
         try:
             connect = websockets.connect(
                 self._url,
                 additional_headers=headers,
                 max_size=None,
                 open_timeout=self._connect_timeout,
+                ssl=tls,
             )
             self._ws = await connect
         except TypeError:
@@ -165,6 +186,7 @@ class OpenAIRealtimeClient:
                 extra_headers=headers,  # type: ignore[call-arg]
                 max_size=None,
                 open_timeout=self._connect_timeout,
+                ssl=tls,
             )
             self._ws = await connect
         except InvalidStatus as exc:
@@ -173,6 +195,20 @@ class OpenAIRealtimeClient:
             raise UpstreamError(
                 code="connect_timeout",
                 message="could not reach translation service",
+            ) from exc
+        except ssl.SSLError as exc:
+            # TLS failures (expired/MITM/untrusted CA) are OSError
+            # subclasses: catch them first so they are not reported as
+            # a generic connect failure. The detail is safe to log
+            # (host/cert info only, never the API key).
+            log.warning(
+                "upstream TLS failed type=%s detail=%s",
+                type(exc).__name__,
+                exc,
+            )
+            raise UpstreamError(
+                code="tls_error",
+                message="secure connection to translation service failed",
             ) from exc
         except OSError as exc:
             raise UpstreamError(

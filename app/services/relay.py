@@ -21,6 +21,7 @@ import base64
 import binascii
 import json
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from app.core.config import Settings
@@ -156,6 +157,15 @@ class RelaySession:
         # session.update sent at connect time. Repeat language-config
         # events for the same language are skipped, never re-sent.
         self._applied_target_language = settings.translation_target_language
+        # Growing-window subtitle state: ``_subtitle_rev`` bumps on every
+        # (re)translation so stale tasks drop their pieces; only the
+        # latest rev may emit. ``_subtitle_task`` is the in-flight
+        # provisional translation, cancelled whenever a newer word
+        # arrives. ``_subtitle_fatal`` latches a misconfiguration
+        # (e.g. missing API key) so later words pass through quietly.
+        self._subtitle_rev = 0
+        self._subtitle_task: asyncio.Task | None = None
+        self._subtitle_fatal = False
         # Audio flow counters (metadata only, never payloads).
         self._audio_chunks = 0
         self._audio_bytes = 0
@@ -240,10 +250,12 @@ class RelaySession:
             self._log_session_summary(reason)
             return reason
         finally:
+            self._cancel_subtitle_task()
             for task in (c2u, u2c):
                 if not task.done():
                     task.cancel()
             await asyncio.gather(c2u, u2c, return_exceptions=True)
+            await self._join_subtitle_task()
             await self._close_both()
     async def _close_both(self) -> None:
         for sock in (self._client, self._upstream):
@@ -309,23 +321,166 @@ class RelaySession:
     def _update_subtitle_target(self, target_language: str) -> None:
         if target_language != self._subtitle_target_language:
             self._subtitle_target_language = target_language
+            self._cancel_subtitle_task()
             try:
                 self._subtitle.clear_history()
             except Exception:
                 pass
 
+    def _cancel_subtitle_task(self) -> None:
+        task, self._subtitle_task = self._subtitle_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _join_subtitle_task(self) -> None:
+        task, self._subtitle_task = self._subtitle_task, None
+        if task is not None:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
     def _subtitle_source_language(self) -> str | None:
         return self._subtitle_source
+
+    def _subtitle_emit_delta(
+        self, rev: int, seg: str, item_id: str, pieces: list[str]
+    ) -> Callable[[str], Awaitable[None]]:
+        """Build the streaming sink for one (re)translation revision.
+
+        Only the latest ``rev`` may emit; stale revisions drop their
+        pieces so the frontend never interleaves two snapshots. Each
+        translated segment starts on a new line so consecutive captions
+        don't run together on the client.
+        """
+
+        async def _emit(piece: str) -> None:
+            if not piece:
+                return
+            if rev != self._subtitle_rev:
+                return
+            if not pieces and not piece.startswith("\n"):
+                piece = "\n" + piece
+            pieces.append(piece)
+            try:
+                await self._client.send_text(
+                    TranscriptDeltaEvent(
+                        delta=piece, item_id=item_id, seg_id=seg, rev=rev
+                    ).model_dump_json()
+                )
+            except Exception:
+                pass
+
+        return _emit
+
+    def _spawn_subtitle_provisional(
+        self,
+        *,
+        snapshot: str,
+        seg: str,
+        rev: int,
+        item_id: str,
+        source: str | None,
+        target: str,
+    ) -> None:
+        """Re-translate a growing snapshot without blocking the loop.
+
+        The previous provisional translation is cancelled: its revision
+        is stale and its pieces (if any already sent) are superseded by
+        this revision, which the frontend uses as the replacement text.
+        Failures are silent; the next word retriggers the translation.
+        """
+        self._cancel_subtitle_task()
+
+        async def _run() -> None:
+            pieces: list[str] = []
+            try:
+                await self._subtitle.translate_snapshot(
+                    snapshot,
+                    target_language=target,
+                    source_language=source,
+                    on_chunk=self._subtitle_emit_delta(rev, seg, item_id, pieces),
+                )
+            except asyncio.CancelledError:
+                pass
+            except SubtitleError as exc:
+                if exc.code == "not_configured":
+                    self._subtitle_fatal = True
+                log.debug("subtitle provisional skipped code=%s", exc.code)
+            except Exception as exc:
+                log.debug(
+                    "subtitle provisional failed type=%s", type(exc).__name__
+                )
+
+        self._subtitle_task = asyncio.create_task(_run())
+
+    async def _translate_subtitle_final(
+        self,
+        snapshot: str,
+        *,
+        seg: str,
+        rev: int,
+        item_id: str,
+        source: str | None,
+        target: str,
+    ) -> str | None:
+        """Translate a finalized window, stream it, and send its completion.
+
+        Emits streaming deltas for ``(seg, rev)`` followed by a
+        ``transcript.completed`` carrying the same ``seg_id`` as the
+        segment-final identifier. Returns the translated text, or None
+        when translation failed and the caller must fall back.
+        """
+        pieces: list[str] = []
+        try:
+            translated = await self._subtitle.translate_snapshot(
+                snapshot,
+                target_language=target,
+                source_language=source,
+                on_chunk=self._subtitle_emit_delta(rev, seg, item_id, pieces),
+            )
+        except SubtitleError as exc:
+            if exc.code == "not_configured":
+                self._subtitle_fatal = True
+            log.warning("subtitle final skipped code=%s", exc.code)
+            return None
+        except Exception as exc:
+            log.warning(
+                "subtitle final failed type=%s", type(exc).__name__
+            )
+            return None
+        if not translated or not translated.strip():
+            return None
+        if not translated.startswith("\n"):
+            translated = "\n" + translated
+        try:
+            await self._client.send_text(
+                TranscriptCompletedEvent(
+                    transcript=translated, item_id=item_id, seg_id=seg
+                ).model_dump_json()
+            )
+        except Exception:
+            return None
+        log.debug(
+            "subtitle segment done seg=%s chars=%d->%d streamed=%d",
+            seg,
+            len(snapshot),
+            len(translated),
+            len(pieces),
+        )
+        return translated
 
     async def _maybe_translate_subtitle(self, mapped: Any) -> Any:
         if not self._transcription_mode:
             return mapped
+        if self._subtitle_fatal:
+            return mapped
         if not getattr(self._subtitle, "enabled", False):
             return mapped
         if isinstance(mapped, TranscriptDeltaEvent):
-            text, store, field = mapped.delta, False, "delta"
+            text, is_delta = mapped.delta, True
         elif isinstance(mapped, TranscriptCompletedEvent):
-            text, store, field = mapped.transcript, True, "transcript"
+            text, is_delta = mapped.transcript, False
         else:
             return mapped
         if not text or not text.strip():
@@ -334,62 +489,74 @@ class RelaySession:
         target = self._subtitle_target_language
         if source and is_same_language(source, target):
             return mapped
-        streamed: list[str] = []
-
-        async def _emit_piece(piece: str) -> None:
-            if not piece:
-                return
-            # Each translated sentence starts on a new line so consecutive
-            # captions don't run together on the client.
-            if not streamed and not piece.startswith("\n"):
-                piece = "\n" + piece
-            streamed.append(piece)
-            try:
-                await self._client.send_text(
-                    TranscriptDeltaEvent(
-                        delta=piece, item_id=mapped.item_id
-                    ).model_dump_json()
-                )
-            except Exception:
-                pass
-
-        try:
-            translated = await self._subtitle.translate(
-                text,
-                target_language=target,
-                source_language=source,
-                store=store,
-                item_id=mapped.item_id,
-                on_chunk=_emit_piece,
-            )
-        except SubtitleError as exc:
-            log.warning("subtitle translation skipped code=%s", exc.code)
-            return mapped
-        except Exception as exc:
-            log.warning(
-                "subtitle translation failed type=%s", type(exc).__name__
-            )
-            return mapped
-        if translated is None:
-            return None
-        if not translated.strip():
-            return mapped
-        log.debug(
-            "subtitle translated chars=%d->%d store=%s streamed=%d",
-            len(text),
-            len(translated),
-            store,
-            len(streamed),
-        )
-        if not translated.startswith("\n"):
-            translated = "\n" + translated
-        if field == "delta":
-            if streamed:
+        translator = self._subtitle
+        if is_delta:
+            # Growing window: accumulate the word and re-translate the
+            # whole snapshot immediately; the frontend replaces the
+            # seg line with each new revision.
+            snapshot = translator.push_fragment(text)
+            if not snapshot.strip():
                 return None
-            return TranscriptDeltaEvent(delta=translated, item_id=mapped.item_id)
-        return TranscriptCompletedEvent(
-            transcript=translated, item_id=mapped.item_id
+            if translator.should_finalize(snapshot):
+                translator.take_window()
+                head, tail = translator.split_for_finalize(snapshot)
+                seg = translator.seg_id
+                self._cancel_subtitle_task()
+                self._subtitle_rev += 1
+                translated = await self._translate_subtitle_final(
+                    head,
+                    seg=seg,
+                    rev=self._subtitle_rev,
+                    item_id=mapped.item_id,
+                    source=source,
+                    target=target,
+                )
+                if translated is None:
+                    translator.set_window(snapshot)
+                    return mapped
+                translator.commit(head, translated.lstrip("\n"))
+                if tail.strip():
+                    translator.set_window(tail)
+                    self._subtitle_rev += 1
+                    self._spawn_subtitle_provisional(
+                        snapshot=translator.current_snapshot(),
+                        seg=translator.seg_id,
+                        rev=self._subtitle_rev,
+                        item_id=mapped.item_id,
+                        source=source,
+                        target=target,
+                    )
+                return None
+            self._subtitle_rev += 1
+            self._spawn_subtitle_provisional(
+                snapshot=snapshot,
+                seg=translator.seg_id,
+                rev=self._subtitle_rev,
+                item_id=mapped.item_id,
+                source=source,
+                target=target,
+            )
+            return None
+        # Turn end: the window is the segment, extended by the
+        # completion itself when it carries trailing words.
+        snapshot = translator.take_final(text)
+        if not snapshot.strip():
+            return mapped
+        seg = translator.seg_id
+        self._cancel_subtitle_task()
+        self._subtitle_rev += 1
+        translated = await self._translate_subtitle_final(
+            snapshot,
+            seg=seg,
+            rev=self._subtitle_rev,
+            item_id=mapped.item_id,
+            source=source,
+            target=target,
         )
+        if translated is None:
+            return mapped
+        translator.commit(snapshot, translated.lstrip("\n"))
+        return None
     async def _apply_transcription_config(self, source_lang: str) -> str | None:
         """Forward a transcription language hint upstream. Returns stop reason."""
         if self._workflow.name == "soniox":

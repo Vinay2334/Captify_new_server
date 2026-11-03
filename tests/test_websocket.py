@@ -170,11 +170,17 @@ def test_translated_transcript_deltas_forwarded():
             "type": "transcript.delta",
             "delta": "Hol",
             "item_id": "",
+            "seg_id": "",
+            "rev": 0,
+            "final": False,
         }
         assert second == {
             "type": "transcript.delta",
             "delta": "a.",
             "item_id": "",
+            "seg_id": "",
+            "rev": 0,
+            "final": False,
         }
 
 

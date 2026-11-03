@@ -1,4 +1,4 @@
-"""Subtitle factory and segment-buffer tests (mocked, no network)."""
+"""Subtitle growing-window tests (mocked, no network)."""
 
 import asyncio
 import json
@@ -32,28 +32,23 @@ def test_subtitle_defaults_to_disabled(monkeypatch):
     assert translator.enabled is False
 
 
-def test_subtitle_buffer_defaults(monkeypatch):
+def test_subtitle_window_cap_default_and_validation(monkeypatch):
+    # The old minimum-size and flush-age knobs are gone: extra env input
+    # is ignored, and only the window cap remains.
     for var in (
         "SUBTITLE_MIN_SEGMENT_CHARS",
-        "SUBTITLE_MAX_SEGMENT_CHARS",
         "SUBTITLE_FLUSH_SECONDS",
     ):
         monkeypatch.delenv(var, raising=False)
     settings = make_settings()
-    assert settings.subtitle_min_segment_chars == 20
     assert settings.subtitle_max_segment_chars == 300
-    assert settings.subtitle_flush_seconds == 2.0
 
-
-def test_subtitle_buffer_config_rejected_when_invalid():
     import pydantic
 
     with pytest.raises((ValueError, pydantic.ValidationError)):
-        make_settings(SUBTITLE_MIN_SEGMENT_CHARS=-1)
-    with pytest.raises((ValueError, pydantic.ValidationError)):
         make_settings(SUBTITLE_MAX_SEGMENT_CHARS=-1)
-    with pytest.raises((ValueError, pydantic.ValidationError)):
-        make_settings(SUBTITLE_FLUSH_SECONDS=0)
+    # Removed knobs never fail validation; they are simply ignored.
+    make_settings(SUBTITLE_MIN_SEGMENT_CHARS=-1, SUBTITLE_FLUSH_SECONDS=0)
 
 
 def test_subtitle_invalid_provider_rejected():
@@ -79,20 +74,18 @@ def test_subtitle_factory_selects_deepseek():
     assert SubtitleFactory.provider_name(settings) == "deepseek"
 
 
-def test_subtitle_factory_configures_buffer_from_settings():
+def test_subtitle_factory_passes_window_cap_and_context():
     from app.services.subtitle_factory import SubtitleFactory
 
     settings = make_settings(
         SUBTITLE_PROVIDER="deepseek",
         DEEPSEEK_API_KEY="deepseek-test-key",
-        SUBTITLE_MIN_SEGMENT_CHARS=7,
         SUBTITLE_MAX_SEGMENT_CHARS=80,
-        SUBTITLE_FLUSH_SECONDS=1.5,
+        SUBTITLE_CONTEXT_SEGMENTS=5,
     )
     translator = SubtitleFactory.get_translator(settings)
-    assert translator._buffer._min_chars == 7
-    assert translator._buffer._max_chars == 80
-    assert translator._buffer._flush_seconds == 1.5
+    assert translator.max_chars == 80
+    assert translator._context_segments == 5
 
 
 def test_deepseek_default_model_is_flash():
@@ -102,41 +95,21 @@ def test_deepseek_default_model_is_flash():
     assert translator.model == "deepseek-flash"
 
 
-def test_null_translator_passes_text_through(monkeypatch):
+def test_null_translator_passes_snapshot_through(monkeypatch):
     from app.services.subtitle_factory import SubtitleFactory
 
     monkeypatch.setenv("SUBTITLE_PROVIDER", "none")
     translator = SubtitleFactory.get_translator(make_settings())
 
     async def _run():
-        assert await translator.translate("Hello", target_language="hi") == "Hello"
-        assert await translator.translate("", target_language="hi") == ""
         assert (
-            await translator.translate(
-                "Hello", target_language="hi", store=False, item_id="x"
-            )
+            await translator.translate_snapshot("Hello", target_language="hi")
             == "Hello"
         )
-
-    asyncio.run(_run())
-
-
-def test_null_translator_ignores_on_chunk(monkeypatch):
-    from app.services.subtitle_factory import SubtitleFactory
-
-    monkeypatch.setenv("SUBTITLE_PROVIDER", "none")
-    translator = SubtitleFactory.get_translator(make_settings())
-    seen = []
-
-    async def _collect(piece):
-        seen.append(piece)
-
-    async def _run():
-        result = await translator.translate(
-            "Hello", target_language="hi", on_chunk=_collect
-        )
-        assert result == "Hello"
-        assert seen == []
+        assert await translator.translate_snapshot("", target_language="hi") == ""
+        assert translator.push_fragment("Hello") == "Hello"
+        assert translator.should_finalize("Hello.") is False
+        assert translator.take_final("full turn") == "full turn"
 
     asyncio.run(_run())
 
@@ -174,24 +147,34 @@ def test_rolling_window_includes_previous_segments():
     )
 
     async def _run():
-        first = await translator.translate("First segment.", target_language="hi")
-        assert "First segment" not in first or first.startswith("TRANSLATED:")
+        first = await translator.translate_snapshot(
+            "First segment.", target_language="hi"
+        )
+        assert first.startswith("TRANSLATED:")
+        translator.commit("First segment.", first)
         # Second call must carry the first segment as context.
-        await translator.translate("Second segment.", target_language="hi")
+        await translator.translate_snapshot("Second segment.", target_language="hi")
+        translator.commit("Second segment.", "second-t")
         prompt_text = json.dumps(seen_messages[-1])
         assert "First segment." in prompt_text
         assert "Second segment." in prompt_text
-        # Window of 2: after 3 segments the oldest drops out.
-        await translator.translate("Third segment.", target_language="hi")
-        await translator.translate("Fourth segment.", target_language="hi")
+        # Window of 2: after 3 committed segments the oldest drops out.
+        third = await translator.translate_snapshot(
+            "Third segment.", target_language="hi"
+        )
+        translator.commit("Third segment.", third)
+        fourth = await translator.translate_snapshot(
+            "Fourth segment.", target_language="hi"
+        )
+        translator.commit("Fourth segment.", fourth)
         prompt_text = json.dumps(seen_messages[-1])
         assert "First segment." not in prompt_text
-        assert "Second segment." in prompt_text or "Third segment." in prompt_text
+        assert "Third segment." in prompt_text or "Second segment." in prompt_text
 
     asyncio.run(_run())
 
 
-def test_rolling_window_delta_does_not_pollute_history():
+def test_snapshot_never_touches_history_until_commit():
     from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
 
     calls = []
@@ -217,10 +200,13 @@ def test_rolling_window_delta_does_not_pollute_history():
     )
 
     async def _run():
-        await translator.translate("Final one.", target_language="hi")
-        assert len(translator.history) == 1
-        await translator.translate("parti", target_language="hi", store=False)
-        assert len(translator.history) == 1
+        # Provisional re-translations (one per word) never pollute history.
+        await translator.translate_snapshot("parti", target_language="hi")
+        await translator.translate_snapshot("partial window", target_language="hi")
+        assert translator.history == []
+        # Only the segment-final commit records history.
+        translator.commit("partial window", "t")
+        assert translator.history == [("partial window", "t")]
 
     asyncio.run(_run())
 
@@ -237,64 +223,59 @@ def test_deepseek_empty_text_never_calls_http():
     )
 
     async def _run():
-        assert await translator.translate("   ", target_language="hi") == "   "
+        assert await translator.translate_snapshot("   ", target_language="hi") == "   "
 
     asyncio.run(_run())
 
 
-def test_buffer_accumulates_fragments_until_sentence_end():
-    from app.services.subtitle_factory import SubtitleSegmentBuffer
-
-    buf = SubtitleSegmentBuffer()
-    assert buf.take_ready("a") == ""
-    buf.add("a", "And")
-    assert buf.take_ready("a") == ""
-    buf.add("a", " ask")
-    buf.add("a", " you")
-    buf.add("a", " guys")
-    assert buf.take_ready("a") == ""
-    buf.add("a", ".")
-    assert buf.take_ready("a") == "And ask you guys."
-    assert buf.take_ready("a") == ""
-
-
-def test_buffer_splits_long_segments_at_word_boundary():
-    from app.services.subtitle_factory import SubtitleSegmentBuffer
-
-    buf = SubtitleSegmentBuffer(min_chars=1000, max_chars=11, flush_seconds=60.0)
-    buf.add("a", "hello world. bye", now=100.0)
-    assert buf.take_ready("a", now=100.0) == "hello"
-    buf.add("a", "!", now=100.0)
-    assert buf.take_ready("a", now=100.0) == "world. bye!"
-
-
-def test_buffer_flushes_on_age_past_minimum():
-    from app.services.subtitle_factory import SubtitleSegmentBuffer
-
-    buf = SubtitleSegmentBuffer(min_chars=5, max_chars=0, flush_seconds=2.0)
-    buf.add("a", "hello world", now=100.0)
-    assert buf.take_ready("a", now=101.0) == ""
-    assert buf.take_ready("a", now=102.5) == "hello world"
-    assert buf.take_ready("a", now=103.0) == ""
-    # Below the minimum: age alone never flushes a stub.
-    buf.add("b", "hi", now=200.0)
-    assert buf.take_ready("b", now=205.0) == ""
-
-
-def test_buffer_take_all_prefers_buffer_over_fallback():
-    from app.services.subtitle_factory import SubtitleSegmentBuffer
-
-    buf = SubtitleSegmentBuffer()
-    assert buf.take_all("a", fallback="full turn") == "full turn"
-    buf.add("a", "tail words")
-    assert buf.take_all("a", fallback="full turn text") == "tail words"
-    assert buf.take_all("a", fallback="full turn text") == "full turn text"
-
-
-def test_buffer_put_back_restores_failed_flush():
+def test_window_grows_word_by_word_until_sentence_end():
     from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
 
-    calls = []
+    translator = DeepseekFlashSubtitleTranslator(api_key="k")
+    assert translator.seg_id == "seg-0"
+    assert translator.push_fragment("And") == "And"
+    assert translator.push_fragment(" ask") == "And ask"
+    assert translator.push_fragment(" you") == "And ask you"
+    assert translator.should_finalize("And ask you") is False
+    assert translator.push_fragment(" guys.") == "And ask you guys."
+    assert translator.should_finalize(translator.current_snapshot()) is True
+    head, tail = translator.split_for_finalize(translator.current_snapshot())
+    assert (head, tail) == ("And ask you guys.", "")
+    translator.take_window()
+    translator.commit(head, "translation")
+    assert translator.seg_id == "seg-1"
+    assert translator.history == [("And ask you guys.", "translation")]
+
+
+def test_window_cap_splits_at_word_boundary():
+    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
+
+    translator = DeepseekFlashSubtitleTranslator(api_key="k", max_chars=11)
+    snapshot = translator.push_fragment("hello world. bye")
+    assert snapshot == "hello world. bye"
+    assert translator.should_finalize(snapshot) is True
+    head, tail = translator.split_for_finalize(snapshot)
+    assert head == "hello"
+    assert tail == "world. bye"
+
+
+def test_take_final_prefers_completion_tail():
+    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
+
+    translator = DeepseekFlashSubtitleTranslator(api_key="k")
+    # Trailing punctuation often arrives only in the completion.
+    translator.push_fragment("uno")
+    translator.push_fragment(" dos")
+    assert translator.take_final("uno dos.") == "uno dos."
+    # An empty window falls back to the completion itself.
+    assert translator.take_final("full turn") == "full turn"
+    # A window the completion does not extend wins as-is.
+    translator.push_fragment("stale words here")
+    assert translator.take_final("unrelated") == "stale words here"
+
+
+def test_failed_snapshot_keeps_window_and_history():
+    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
 
     class FlakyClient:
         def __init__(self):
@@ -312,7 +293,6 @@ def test_buffer_put_back_restores_failed_flush():
                 def json(self):
                     return {"choices": [{"message": {"content": "ok"}}]}
 
-            calls.append(json["messages"][-1]["content"])
             return Resp()
 
         async def aclose(self):
@@ -323,19 +303,147 @@ def test_buffer_put_back_restores_failed_flush():
     )
 
     async def _run():
+        translator.push_fragment("Hello world.")
         with pytest.raises(Exception):
-            await translator.translate(
-                "Hello world.", target_language="hi", store=False, item_id="t1"
+            await translator.translate_snapshot(
+                translator.current_snapshot(), target_language="hi"
             )
-        # The failed flush was restored, so the continuation still
-        # carries the whole sentence to DeepSeek.
-        result = await translator.translate(
-            " Again.", target_language="hi", store=False, item_id="t1"
+        # The stateless snapshot call never touches window or history.
+        assert translator.current_snapshot() == "Hello world."
+        assert translator.history == []
+        assert (
+            await translator.translate_snapshot(
+                translator.current_snapshot(), target_language="hi"
+            )
+            == "ok"
         )
-        assert result == "ok"
-        assert "Hello world. Again." in calls[-1]
 
     asyncio.run(_run())
+
+
+def test_deepseek_streams_tokens_as_they_arrive():
+    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
+
+    http = FakeHTTP(script=[["Hel", "", "lo", " world"]])
+    translator = DeepseekFlashSubtitleTranslator(api_key="k", http_client=http)
+    seen = []
+
+    async def _collect(piece):
+        seen.append(piece)
+
+    async def _run():
+        result = await translator.translate_snapshot(
+            "Hello world.", target_language="hi", on_chunk=_collect
+        )
+        assert seen == ["Hel", "lo", " world"]
+        assert result == "Hello world"
+        # Stateless: streaming alone never records history.
+        assert translator.history == []
+
+    asyncio.run(_run())
+
+
+def test_stream_skips_noise_and_empty_deltas():
+    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
+
+    http = FakeHTTP(script=[["a", "", "b"]])
+    translator = DeepseekFlashSubtitleTranslator(api_key="k", http_client=http)
+    seen = []
+
+    async def _collect(piece):
+        seen.append(piece)
+
+    async def _run():
+        result = await translator.translate_snapshot(
+            "Sentence.", target_language="hi", on_chunk=_collect
+        )
+        assert seen == ["a", "b"]
+        assert result == "ab"
+
+    asyncio.run(_run())
+
+
+def test_stream_http_error_leaves_window_untouched():
+    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
+
+    class FailingStream:
+        def raise_for_status(self):
+            raise RuntimeError("500")
+
+        async def aiter_lines(self):  # pragma: no cover
+            yield ""
+
+    class FailingContext:
+        async def __aenter__(self):
+            return FailingStream()
+
+        async def __aexit__(self, *args):
+            return False
+
+    class FailingHTTP:
+        def stream(self, *args, **kwargs):
+            return FailingContext()
+
+        async def aclose(self):
+            pass
+
+    translator = DeepseekFlashSubtitleTranslator(
+        api_key="k", http_client=FailingHTTP()
+    )
+
+    async def _run():
+        translator.push_fragment("Hello world.")
+        with pytest.raises(Exception):
+            await translator.translate_snapshot(
+                translator.current_snapshot(), target_language="hi"
+            )
+
+    asyncio.run(_run())
+    assert translator.current_snapshot() == "Hello world."
+    assert translator.history == []
+
+
+def test_stream_malformed_event_raises():
+    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
+
+    class BadStream:
+        def raise_for_status(self):
+            pass
+
+        async def aiter_lines(self):
+            yield "data: {not json"
+
+    class BadContext:
+        async def __aenter__(self):
+            return BadStream()
+
+        async def __aexit__(self, *args):
+            return False
+
+    class BadHTTP:
+        def stream(self, *args, **kwargs):
+            return BadContext()
+
+        async def aclose(self):
+            pass
+
+    translator = DeepseekFlashSubtitleTranslator(api_key="k", http_client=BadHTTP())
+
+    async def _run():
+        seen = []
+
+        async def _collect(piece):
+            seen.append(piece)
+
+        with pytest.raises(Exception):
+            await translator.translate_snapshot(
+                "Hello world.", target_language="hi", on_chunk=_collect
+            )
+        assert seen == []
+
+    asyncio.run(_run())
+
+
 class FakeClient:
     def __init__(self, incoming=None):
         self.incoming = asyncio.Queue()
@@ -442,149 +550,20 @@ class FakeHTTP:
         pass
 
 
-def _delta(frag, item_id="item_1"):
-    return json.dumps(
-        {
-            "type": "conversation.item.input_audio_transcription.delta",
-            "delta": frag,
-            "item_id": item_id,
-        }
-    )
+def _delta_event(frag, item_id="item_1"):
+    from app.schemas.events import TranscriptDeltaEvent
+
+    return TranscriptDeltaEvent(delta=frag, item_id=item_id)
 
 
-def _completed(transcript, item_id="item_1"):
-    return json.dumps(
-        {
-            "type": "conversation.item.input_audio_transcription.completed",
-            "transcript": transcript,
-            "item_id": item_id,
-        }
-    )
+def _completed_event(transcript, item_id="item_1"):
+    from app.schemas.events import TranscriptCompletedEvent
 
-
-def test_deepseek_streams_tokens_as_they_arrive():
-    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
-
-    http = FakeHTTP(script=[["Hel", "", "lo", " world"]])
-    translator = DeepseekFlashSubtitleTranslator(api_key="k", http_client=http)
-    seen = []
-
-    async def _collect(piece):
-        seen.append(piece)
-
-    async def _run():
-        result = await translator.translate(
-            "Hello world.", target_language="hi", on_chunk=_collect
-        )
-        assert seen == ["Hel", "lo", " world"]
-        assert result == "Hello world"
-        assert translator.history == [("Hello world.", "Hello world")]
-
-    asyncio.run(_run())
-
-
-def test_stream_skips_noise_and_empty_deltas():
-    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
-
-    http = FakeHTTP(script=[["a", "", "b"]])
-    translator = DeepseekFlashSubtitleTranslator(api_key="k", http_client=http)
-    seen = []
-
-    async def _collect(piece):
-        seen.append(piece)
-
-    async def _run():
-        result = await translator.translate(
-            "Sentence.", target_language="hi", store=False, item_id="t",
-            on_chunk=_collect,
-        )
-        assert seen == ["a", "b"]
-        assert result == "ab"
-
-    asyncio.run(_run())
-
-
-def test_stream_http_error_restores_buffer():
-    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
-
-    class FailingStream:
-        def raise_for_status(self):
-            raise RuntimeError("500")
-
-        async def aiter_lines(self):  # pragma: no cover
-            yield ""
-
-    class FailingContext:
-        async def __aenter__(self):
-            return FailingStream()
-
-        async def __aexit__(self, *args):
-            return False
-
-    class FailingHTTP:
-        def stream(self, *args, **kwargs):
-            return FailingContext()
-
-        async def aclose(self):
-            pass
-
-    translator = DeepseekFlashSubtitleTranslator(
-        api_key="k", http_client=FailingHTTP()
-    )
-
-    async def _run():
-        with pytest.raises(Exception):
-            await translator.translate(
-                "Hello world.", target_language="hi", store=False, item_id="t1"
-            )
-
-    asyncio.run(_run())
-    assert translator._buffer.take_all("t1") == "Hello world."
-
-
-def test_stream_malformed_event_raises_and_restores():
-    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
-
-    class BadStream:
-        def raise_for_status(self):
-            pass
-
-        async def aiter_lines(self):
-            yield "data: {not json"
-
-    class BadContext:
-        async def __aenter__(self):
-            return BadStream()
-
-        async def __aexit__(self, *args):
-            return False
-
-    class BadHTTP:
-        def stream(self, *args, **kwargs):
-            return BadContext()
-
-        async def aclose(self):
-            pass
-
-    translator = DeepseekFlashSubtitleTranslator(api_key="k", http_client=BadHTTP())
-
-    async def _run():
-        seen = []
-
-        async def _collect(piece):
-            seen.append(piece)
-
-        with pytest.raises(Exception):
-            await translator.translate(
-                "Hello world.", target_language="hi", on_chunk=_collect
-            )
-        assert seen == []
-
-    asyncio.run(_run())
+    return TranscriptCompletedEvent(transcript=transcript, item_id=item_id)
 
 
 @pytest.mark.asyncio
-async def test_relay_streams_sentence_pieces():
+async def test_relay_replaces_provisional_then_finalizes_turn():
     from app.services.relay import RelaySession
     from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
 
@@ -594,35 +573,100 @@ async def test_relay_streams_sentence_pieces():
         OPENAI_TRANSLATION_SOURCE_LANGUAGE="",
     )
     client = FakeClient()
-    upstream = FakeUpstream(
-        [
-            _delta("And"),
-            _delta(" ask"),
-            _delta(" you"),
-            _delta(" guys."),
-            _completed("And ask you guys."),
-        ]
-    )
-    http = FakeHTTP(script=[["Nam", "aste"], ["Poora", " anuvaad"]])
+    upstream = FakeUpstream()
+    http = FakeHTTP(script=[["uno"], ["uno dos"], ["UNO DOS"]])
     translator = DeepseekFlashSubtitleTranslator(api_key="k", http_client=http)
     relay = RelaySession(client, upstream, settings, subtitle=translator)
-    task = asyncio.create_task(relay.run())
-    await asyncio.sleep(0.5)
-    client.disconnect()
-    upstream.disconnect()
-    await asyncio.wait_for(task, timeout=5)
-    deltas = [json.loads(m) for m in client.sent if "transcript.delta" in m]
-    completed = [json.loads(m) for m in client.sent if "transcript.completed" in m]
-    # Four word fragments collapsed into one streamed sentence, then turn end.
-    # Each translated sentence starts on a new line so captions don't clump.
+
+    # Word 1 grows the window and streams its first translation.
+    assert await relay._maybe_translate_subtitle(_delta_event("uno")) is None
+    await relay._join_subtitle_task()
+    # Word 2 re-translates the whole window as a new revision.
+    assert await relay._maybe_translate_subtitle(_delta_event(" dos")) is None
+    await relay._join_subtitle_task()
+
+    deltas = [json.loads(m) for m in client.sent if '"transcript.delta"' in m]
+    assert [d["seg_id"] for d in deltas] == ["seg-0", "seg-0"]
+    assert [d["rev"] for d in deltas] == [1, 2]
+    assert [d["delta"] for d in deltas] == ["\nuno", "\nuno dos"]
+    # Provisional snapshots never reach history.
+    assert translator.history == []
     assert len(http.calls) == 2
-    assert "And ask you guys." in http.calls[0]
-    assert [d["delta"] for d in deltas] == ["\nNam", "aste", "\nPoora", " anuvaad"]
-    assert [c["transcript"] for c in completed] == ["\nPoora anuvaad"]
+    assert "uno dos" in http.calls[1]
+
+    # Turn end finalizes the window under the same seg_id.
+    assert (
+        await relay._maybe_translate_subtitle(_completed_event("uno dos."))
+        is None
+    )
+    messages = [json.loads(m) for m in client.sent]
+    assert messages[-1]["type"] == "transcript.completed"
+    assert messages[-1]["seg_id"] == "seg-0"
+    assert messages[-1]["transcript"] == "\nUNO DOS"
+    assert translator.history == [("uno dos.", "UNO DOS")]
+    assert translator._seg_index == 1
 
 
 @pytest.mark.asyncio
-async def test_relay_same_language_skips_buffering():
+async def test_relay_finalizes_sentence_mid_turn_and_starts_next_window():
+    from app.services.relay import RelaySession
+    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
+
+    settings = make_settings(
+        TRANSCRIBE_MODE=True,
+        OPENAI_TRANSLATION_TARGET_LANGUAGE="hi",
+        OPENAI_TRANSLATION_SOURCE_LANGUAGE="",
+    )
+    client = FakeClient()
+    upstream = FakeUpstream()
+    http = FakeHTTP(script=[["EK"], ["DO"]])
+    translator = DeepseekFlashSubtitleTranslator(api_key="k", http_client=http)
+    relay = RelaySession(client, upstream, settings, subtitle=translator)
+
+    assert await relay._maybe_translate_subtitle(_delta_event("Hello.")) is None
+    assert await relay._maybe_translate_subtitle(_delta_event("Again.")) is None
+
+    completed = [json.loads(m) for m in client.sent if "transcript.completed" in m]
+    assert [c["seg_id"] for c in completed] == ["seg-0", "seg-1"]
+    assert [c["transcript"] for c in completed] == ["\nEK", "\nDO"]
+    assert [source for source, _ in translator.history] == ["Hello.", "Again."]
+
+
+@pytest.mark.asyncio
+async def test_relay_splits_window_at_char_cap():
+    from app.services.relay import RelaySession
+    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
+
+    settings = make_settings(
+        TRANSCRIBE_MODE=True,
+        OPENAI_TRANSLATION_TARGET_LANGUAGE="hi",
+        OPENAI_TRANSLATION_SOURCE_LANGUAGE="",
+        SUBTITLE_MAX_SEGMENT_CHARS=11,
+    )
+    client = FakeClient()
+    upstream = FakeUpstream()
+    http = FakeHTTP(script=[["H1"], ["HEAD"], ["TAIL"]])
+    translator = DeepseekFlashSubtitleTranslator(
+        api_key="k", max_chars=11, http_client=http
+    )
+    relay = RelaySession(client, upstream, settings, subtitle=translator)
+
+    assert await relay._maybe_translate_subtitle(_delta_event("hello")) is None
+    await relay._join_subtitle_task()
+    assert await relay._maybe_translate_subtitle(_delta_event(" world. bye")) is None
+    await relay._join_subtitle_task()
+
+    completed = [json.loads(m) for m in client.sent if "transcript.completed" in m]
+    assert len(completed) == 1
+    assert completed[0]["seg_id"] == "seg-0"
+    assert completed[0]["transcript"] == "\nHEAD"
+    # The tail keeps growing under the next window.
+    assert translator.current_snapshot() == "world. bye"
+    assert translator.history == [("hello", "HEAD")]
+
+
+@pytest.mark.asyncio
+async def test_relay_same_language_skips_translation():
     from app.services.relay import RelaySession
     from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
 
@@ -638,22 +682,50 @@ async def test_relay_same_language_skips_buffering():
         OPENAI_TRANSLATION_TARGET_LANGUAGE="hi",
     )
     client = FakeClient()
-    upstream = FakeUpstream([_delta("Hello.")])
+    upstream = FakeUpstream()
     translator = DeepseekFlashSubtitleTranslator(
         api_key="k", http_client=ExplodingHTTP()
     )
     relay = RelaySession(client, upstream, settings, subtitle=translator)
-    task = asyncio.create_task(relay.run())
-    await asyncio.sleep(0.3)
-    client.disconnect()
-    upstream.disconnect()
-    await asyncio.wait_for(task, timeout=5)
-    deltas = [json.loads(m) for m in client.sent if "transcript.delta" in m]
-    assert [d["delta"] for d in deltas] == ["Hello."]
+    mapped = _delta_event("Hello.")
+    assert await relay._maybe_translate_subtitle(mapped) is mapped
 
 
 @pytest.mark.asyncio
-async def test_webrtc_streams_sentence_pieces():
+async def test_relay_subtitle_failure_falls_back_to_source():
+    from app.services.relay import RelaySession
+    from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
+
+    class FailingHTTP:
+        def stream(self, *args, **kwargs):
+            raise ConnectionError("boom")
+
+        async def post(self, *args, **kwargs):
+            raise ConnectionError("boom")
+
+        async def aclose(self):
+            pass
+
+    settings = make_settings(
+        TRANSCRIBE_MODE=True,
+        OPENAI_TRANSLATION_TARGET_LANGUAGE="hi",
+        OPENAI_TRANSLATION_SOURCE_LANGUAGE="",
+    )
+    client = FakeClient()
+    upstream = FakeUpstream()
+    translator = DeepseekFlashSubtitleTranslator(
+        api_key="k", http_client=FailingHTTP()
+    )
+    relay = RelaySession(client, upstream, settings, subtitle=translator)
+    mapped = _completed_event("Hello world.")
+    # Turn-end failure passes the source turn through untouched.
+    assert await relay._maybe_translate_subtitle(mapped) is mapped
+    assert client.sent == []
+    assert translator.history == []
+
+
+@pytest.mark.asyncio
+async def test_webrtc_replaces_provisional_then_finalizes_turn():
     from app.services.subtitle_factory import DeepseekFlashSubtitleTranslator
     from app.services.webrtc_session import WebRTCRelaySession
 
@@ -671,25 +743,22 @@ async def test_webrtc_streams_sentence_pieces():
         OPENAI_TRANSLATION_SOURCE_LANGUAGE="",
     )
     channel = FakeChannel()
-    upstream = FakeUpstream(
-        [
-            _delta("And"),
-            _delta(" ask"),
-            _delta(" you"),
-            _delta(" guys."),
-            _completed("And ask you guys."),
-        ]
-    )
-    http = FakeHTTP(script=[["Nam", "aste"], ["Poora", " anuvaad"]])
+    upstream = FakeUpstream()
+    http = FakeHTTP(script=[["uno"], ["UNO DOS"]])
     translator = DeepseekFlashSubtitleTranslator(api_key="k", http_client=http)
     relay = WebRTCRelaySession(channel, upstream, settings, subtitle=translator)
-    task = asyncio.create_task(relay.run())
-    await asyncio.sleep(0.5)
-    relay.on_channel_close()
-    upstream.disconnect()
-    await asyncio.wait_for(task, timeout=5)
-    deltas = [json.loads(m) for m in channel.sent if "transcript.delta" in m]
-    completed = [json.loads(m) for m in channel.sent if "transcript.completed" in m]
-    assert len(http.calls) == 2
-    assert [d["delta"] for d in deltas] == ["\nNam", "aste", "\nPoora", " anuvaad"]
-    assert [c["transcript"] for c in completed] == ["\nPoora anuvaad"]
+
+    assert await relay._maybe_translate_subtitle(_delta_event("uno dos")) is None
+    await relay._join_subtitle_task()
+    assert (
+        await relay._maybe_translate_subtitle(_completed_event("uno dos."))
+        is None
+    )
+
+    messages = [json.loads(m) for m in channel.sent]
+    kinds = [m["type"] for m in messages]
+    assert kinds == ["transcript.delta", "transcript.delta", "transcript.completed"]
+    assert messages[0]["seg_id"] == "seg-0"
+    assert messages[-1]["seg_id"] == "seg-0"
+    assert messages[-1]["transcript"] == "\nUNO DOS"
+    assert translator.history == [("uno dos.", "UNO DOS")]

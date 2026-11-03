@@ -50,16 +50,21 @@ Two client transports are supported; both feed the same upstream session.
   `DEEPSEEK_API_KEY`) to translate `openai-live-transcribe` transcripts
   into the session target language with the `deepseek-flash` chat model
   (`SUBTITLE_MODEL`). The last `SUBTITLE_CONTEXT_SEGMENTS` (default 3)
-  segments travel as context so pronouns and topic stay consistent; only
-  the current segment is translated. Transcription deltas arrive word by
-  word, so fragments are buffered per turn and DeepSeek is only called for
-  flush-ready segments (sentence end, `SUBTITLE_MAX_SEGMENT_CHARS` cap, or
-  `SUBTITLE_FLUSH_SECONDS` age with `SUBTITLE_MIN_SEGMENT_CHARS` minimum).
+  finalized segments travel as context so pronouns and topic stay
+  consistent; only the current window is translated. Every transcriptor
+  word grows the source window and re-triggers the translation (up to
+  `SUBTITLE_MAX_SEGMENT_CHARS`), so the first translated words stream
+  back as `transcript.delta` events immediately instead of waiting for
+  the sentence to finish. Each window carries a `seg_id` plus a `rev`
+  counter: the frontend replaces the line for `seg_id` whenever `rev`
+  bumps (token pieces within one `rev` append). A window finalizes on
+  sentence end, at the character cap, or at turn end; the backend then
+  sends `transcript.completed` with the same `seg_id` as the
+  segment-final identifier and the next window starts under the next
+  `seg_id`. Only finalized segments enter the history context.
   Applies to transcription-mode
   transcripts on both transports; failures fall back to the original text.
-  Sentences stream token-by-token as `transcript.delta` events while
-  DeepSeek responds, then land as `transcript.completed`; committed
-  sentences are never re-translated. Each translated sentence starts
+  Each translated segment starts
   with a newline so consecutive captions don't run together.
 - Source-language deltas and translated audio (`session.output_audio.delta`)
   are dropped: the downstream protocol is translated-text-only.

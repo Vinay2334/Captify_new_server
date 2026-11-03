@@ -127,14 +127,33 @@ class SessionReadyEvent(BaseModel):
 
 
 class TranscriptDeltaEvent(BaseModel):
+    """One translated update for a growing-window segment.
+
+    The backend re-translates the current source window on every
+    transcriptor word and re-sends the full translated snapshot. The
+    frontend keys lines by ``seg_id``, replaces the line when ``rev``
+    bumps, appends token pieces within one ``rev``, and freezes the
+    line when ``final`` (or the matching ``transcript.completed``)
+    arrives. ``item_id`` stays as the upstream turn id for debugging.
+    """
     type: Literal["transcript.delta"] = "transcript.delta"
     delta: str
+    seg_id: str = ""
+    rev: int = 0
+    final: bool = False
     item_id: str = ""
 
 
 class TranscriptCompletedEvent(BaseModel):
+    """Final translation for a window segment.
+
+    Carries the same ``seg_id`` as the provisional deltas it
+    finalizes. Receiving it freezes that line; the next window uses
+    the next ``seg_id``.
+    """
     type: Literal["transcript.completed"] = "transcript.completed"
     transcript: str
+    seg_id: str = ""
     item_id: str = ""
 
 

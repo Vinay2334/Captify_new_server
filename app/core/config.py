@@ -107,14 +107,12 @@ class Settings(BaseSettings):
         default=15.0, alias="SUBTITLE_TIMEOUT_SECONDS"
     )
 
-    subtitle_min_segment_chars: int = Field(
-        default=20, alias="SUBTITLE_MIN_SEGMENT_CHARS"
-    )
+    # Growing-window cap: a source window finalizes once it reaches
+    # this many characters (sentence ends and turn ends finalize
+    # earlier). Provisional re-translations stream from the first word,
+    # so no minimum size or flush age is needed.
     subtitle_max_segment_chars: int = Field(
         default=300, alias="SUBTITLE_MAX_SEGMENT_CHARS"
-    )
-    subtitle_flush_seconds: float = Field(
-        default=2.0, alias="SUBTITLE_FLUSH_SECONDS"
     )
 
     # Client-facing WebSocket limits.
@@ -186,25 +184,11 @@ class Settings(BaseSettings):
             raise ValueError("must be positive")
         return value
 
-    @field_validator("subtitle_min_segment_chars")
-    @classmethod
-    def _non_negative_subtitle_chars(cls, value: int) -> int:
-        if value < 0:
-            raise ValueError("must be zero or positive")
-        return value
-
     @field_validator("subtitle_max_segment_chars")
     @classmethod
     def _non_negative_subtitle_max(cls, value: int) -> int:
         if value < 0:
             raise ValueError("must be zero or positive")
-        return value
-
-    @field_validator("subtitle_flush_seconds")
-    @classmethod
-    def _positive_subtitle_float(cls, value: float) -> float:
-        if value <= 0:
-            raise ValueError("must be positive")
         return value
 
     def subtitle_enabled(self) -> bool:
