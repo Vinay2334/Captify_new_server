@@ -607,6 +607,7 @@ class WebRTCRelaySession:
                 return f"upstream_error:{exc.code}"
             if mapped is None:
                 continue
+            print("Mapped upstream event:", mapped)
             mapped = await self._maybe_translate_subtitle(mapped)
             if mapped is None:
                 continue
