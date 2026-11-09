@@ -154,25 +154,26 @@ class RollingSubtitleTranslator:
     def _build_messages_deque(
             self,
             text: str,
+            context: str,
             target_language: str,
             source_language: str | None = None,
         ) -> list[dict[str, str]]:
             source_label = source_language or "the speaker's language"
             system = (
                 "You are a live subtitle translator. Translate the CURRENT "
-                f"segment from {source_label} into {target_language}. "
-                "PREVIOUS segments are context only (pronouns, tense, topic): "
+                f"segment from hindi into {target_language}. "
+                "PREVIOUS segment is context only (pronouns, tense, topic): "
                 "do NOT re-translate or repeat them. Return ONLY the translated "
                 "current segment, with no quotes, no explanations, and no extra "
                 "sentences."
+                "The TRANSLATED SEGMENT is also provided which has the translation happened till now of the current given segment"
             )
-            lines = self._buffer.build_context()
-            if lines:
-                user = (
-                    "Previous segments (context only, do NOT re-translate):\n"
-                    + "\n".join(lines)
-                    + f"\n\nCurrent segment (translate this only):\n{text}"
-                )
+            user = ""
+            previous = self._buffer.get_previous()
+            if previous:
+                user += "Previous segments (context only, do NOT re-translate):\n" + previous
+            if context:
+                user += "Translated segment " + self._buffer._current_translated + f"\n\nCurrent segment (translate this only):\n{text}"
             else:
                 user = f"Translate this segment into {target_language}:\n{text}"
             print("RollingSubtitleTranslator._build_messages called with system:", system)
@@ -194,26 +195,17 @@ class RollingSubtitleTranslator:
         item_id: str = "",
         on_chunk: Callable[[str], Awaitable[None]] | None = None,
     ) -> str | None:
+        print(f"translation_called", text)
         if not text or not text.strip():
             return text
         key = item_id or ""
-        seq, context, ready = -1, "", ""
         fragment = self._buffer.add_fragment(text)
         print("RollingSubtitleTranslator.translate called with text:", fragment)
-        if fragment:
-            seq, context, text = fragment
-        else:
-            return text
-        if not store:
-            self._buffer.add(key, text)
-            if not ready:
-                return None
-            text = ready
-        else:
-            text = self._buffer.add_fragment(text) or text
-            if not text.strip():
-                return text
-        messages = self._build_messages_deque(text, target_language, source_language)
+        if not fragment:
+            return None
+        text, context = fragment
+        messages = self._build_messages_deque(text, context, target_language, source_language)
+        print("translation_message", messages)
         try:
             if on_chunk is None:
                 translated = (await self._complete(messages)).strip()
@@ -221,12 +213,14 @@ class RollingSubtitleTranslator:
                 translated = (
                     await self._complete_stream(messages, on_chunk)
                 ).strip()
-            self._buffer.set_translation(seq, translated)
+                print("Translated_segment", translated)
+            self._buffer.set_translation(translated)
         except Exception:
+            print(f"Exception occured on {text}")
             self._buffer.put_back(key, text)
             raise
         if not translated:
-            self._buffer.put_back(key, text)
+            # self._buffer.put_back(key, text)
             return text
         if self._context_segments > 0:
             self._history.append((text, translated))
@@ -425,10 +419,13 @@ class SubtitleSegmentBuffer:
     ) -> None:
         self._min_chars = max(0, int(min_chars))
         self._max_chars = max(0, int(max_chars))
-        self._max_current = 5
+        self._max_current = 50
         self._prev_budget = 50
-        self._current = deque()
+        self._offset = 10
+        self._current_original = ""
+        self._current_translated = ""
         self._previous = deque()
+        self._seq = 0
         try:
             self._flush_seconds = float(flush_seconds)
         except (TypeError, ValueError):
@@ -477,51 +474,47 @@ class SubtitleSegmentBuffer:
 
     def add_fragment(self, text: str):
         """Returns (seq, context, chunk) when a chunk is ready, otherwise None."""
-        if not text or not text.strip():
-            return None
-        self._current.append(text.strip())
-        if self._ends_sentence(text) or len(self._current) >= self._max_current:
+        self._current_original += text
+        if text.strip() and not len(self._current_original)%self._offset:
             return self.flush()
         return None
 
     def flush(self):
         """Call this directly on a VAD pause so trailing words don't stall."""
-        if not self._current:
+        print("Flush_called")
+        if not self._current_original:
             return None
 
-        chunk = " ".join(self._current)
-        self._current.clear()
-
-        seq = self._seq
-        self._seq += 1
+        # if self._ends_sentence(self._current_original) or len(self._current_original) >= self._max_current:
+        #     self._current_original = ""
 
         # Build context BEFORE adding this chunk, so it only contains older chunks
-        context = self._build_context()
+        # idx = max(0, len(self._current_original)-self._offset-1)
+        # to_translate =  self._current_original[idx:]
+        context = self._current_translated
 
+        print(f"COntestxt: {self._current_original} || {context}")
         # Move the chunk into previous now (tgt=None until the translation returns)
-        self._previous.append({"seq": seq, "src": chunk, "tgt": None})
-        self._trim_previous()
+        return self._current_original, context
 
-        return seq, context, chunk
-
-    def set_translation(self, seq: int, tgt: str):
+    def set_translation(self, tgt: str):
         """Call when the translator responds, so later calls get the translated context."""
-        for entry in self._previous:
-            if entry["seq"] == seq:
-                entry["tgt"] = tgt
-                return
-    def build_context(self) -> str:
-        lines = []
-        for e in self._previous:
-            if e["tgt"] is not None:
-                lines.append(f'{e["src"]} => {e["tgt"]}')
-            else:
-                lines.append(f'{e["src"]} => (translation pending)')
-        return "\n".join(lines)
+        self._current_translated += f" {tgt}"
+        print("vdsvsvds", self._current_translated)
+        if self._ends_sentence(self._current_original) or len(self._current_original) >= self._max_current:
+            self._previous.append([self._current_original, self._current_translated])
+            self._trim_previous()
+            self._current_original = ""
+            self._current_translated = ""
+        
     def _trim_previous(self):
         # Drop whole chunks from the left, never partial ones
-        while len(self._previous) > 1 and self._word_count() > self._prev_budget:
+        while len(self._previous) > self._prev_budget:
             self._previous.popleft()
+
+    def get_previous(self):
+        return "\n".join(f"{segment[0]} => {segment[1]}" for segment in self._previous)
+
 
     def take_ready(self, item_id: str, *, now: float | None = None) -> str:
         entry = self._items.get(item_id)

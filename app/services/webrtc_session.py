@@ -24,6 +24,7 @@ import base64
 import binascii
 import json
 import time
+import traceback
 from typing import Any, Callable, Protocol
 
 from app.core.config import Settings
@@ -353,10 +354,14 @@ class WebRTCRelaySession:
                 on_chunk=_emit_piece,
                 item_id=mapped.item_id,
             )
+            print("Translated_delta_event", translated)
         except SubtitleError as exc:
             log.warning("webrtc subtitle translation skipped code=%s", exc.code)
             return mapped
         except Exception as exc:
+            print("Error Type:", type(exec).__name__)
+            print("Error Message:", str(exec))
+            traceback.print_exc()
             log.warning(
                 "webrtc subtitle translation failed type=%s", type(exc).__name__
             )
@@ -368,6 +373,7 @@ class WebRTCRelaySession:
         if not translated.startswith("\n"):
             translated = "\n" + translated
         if isinstance(mapped, TranscriptDeltaEvent):
+            print("TranscroptEvent_emit", streamed)
             if streamed:
                 return None
             return TranscriptDeltaEvent(delta=translated, item_id=mapped.item_id)
@@ -609,6 +615,7 @@ class WebRTCRelaySession:
                 continue
             print("Mapped upstream event:", mapped)
             mapped = await self._maybe_translate_subtitle(mapped)
+            print("Translated_mapped", mapped)
             if mapped is None:
                 continue
             if isinstance(mapped, TranscriptDeltaEvent):
