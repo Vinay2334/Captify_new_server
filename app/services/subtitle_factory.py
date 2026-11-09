@@ -20,7 +20,17 @@ Rolling window: :class:`RollingSubtitleTranslator` keeps the last
 pairs and sends them as context alongside the segment being translated,
 so pronouns, tense, and topic stay consistent across segments. Only the
 current segment is translated; history pairs are context only and are
-never re-emitted.
+never re-emitted. History is additionally capped at
+``MAX_HISTORY_CONTEXT_CHARS`` characters so the prompt cannot grow
+without bound.
+
+Batching: fragments are accumulated per item in
+:class:`SubtitleSegmentBuffer` and DeepSeek is called only when a
+segment is flush-ready (sentence end, ``SUBTITLE_MAX_SEGMENT_CHARS``
+cap, or ``SUBTITLE_FLUSH_SECONDS`` age past a
+``SUBTITLE_MIN_SEGMENT_CHARS`` minimum) -- never per fragment and
+never as an expanding re-send of already-translated text. Each ready
+segment is sent exactly once as the new text to translate.
 """
 
 from __future__ import annotations
@@ -41,6 +51,11 @@ PROVIDER_DEEPSEEK = "deepseek"
 
 DEEPSEEK_DEFAULT_MODEL = "deepseek-flash"
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
+
+# Hard cap on history characters sent as context, however many segments
+# are configured: context is priming only, so it must not grow the
+# prompt (and prefill time) without bound.
+MAX_HISTORY_CONTEXT_CHARS = 600
 
 
 class SubtitleError(Exception):
@@ -81,15 +96,19 @@ class NullSubtitleTranslator:
     def clear_history(self) -> None:
         pass
 
+    async def aclose(self) -> None:
+        pass
+
 
 class RollingSubtitleTranslator:
     """Base translator with a rolling window of previous segments.
 
-    Subclasses implement :meth:`_complete` (one translated string for the
-    current segment). :meth:`translate` builds the context prompt from
-    history, calls :meth:`_complete`, then records the new pair unless
-    ``store`` is False (used for provisional deltas, which must not
-    pollute the window with overlapping fragments).
+    Subclasses implement :meth:`_complete` (one translated string for
+    the current segment). :meth:`translate` buffers fragments until a
+    segment is flush-ready, builds the context prompt from history,
+    calls :meth:`_complete` once for that segment, then records the
+    pair only for final (``store=True``) segments, so provisional
+    deltas never pollute the window with overlapping fragments.
     """
 
     name = "rolling"
@@ -110,10 +129,23 @@ class RollingSubtitleTranslator:
         self._history.clear()
         self._buffer.clear()
 
+    async def aclose(self) -> None:
+        pass
+
     def _history_context(self) -> list[tuple[str, str]]:
         if self._context_segments <= 0:
             return []
-        return list(self._history)[-self._context_segments :]
+        pairs = list(self._history)[-self._context_segments :]
+        kept: list[tuple[str, str]] = []
+        total = 0
+        for pair in reversed(pairs):
+            size = len(pair[0]) + len(pair[1])
+            if total + size > MAX_HISTORY_CONTEXT_CHARS:
+                break
+            kept.append(pair)
+            total += size
+        kept.reverse()
+        return kept
 
     def _build_messages(
         self,
@@ -124,7 +156,7 @@ class RollingSubtitleTranslator:
         source_label = source_language or "the speaker's language"
         system = (
             "You are a live subtitle translator. Translate the CURRENT "
-            f"segment from {source_label} into {target_language}. "
+            f"segment from original language into {target_language}. "
             "PREVIOUS segments are context only (pronouns, tense, topic): "
             "do NOT re-translate or repeat them. Return ONLY the translated "
             "current segment, with no quotes, no explanations, and no extra "
@@ -145,45 +177,30 @@ class RollingSubtitleTranslator:
             )
         else:
             user = f"Translate this segment into {target_language}:\n{text}"
-        print("RollingSubtitleTranslator._build_messages called with system:", system)
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
 
-    def _build_messages_deque(
-            self,
-            text: str,
-            context: str,
-            target_language: str,
-            source_language: str | None = None,
-        ) -> list[dict[str, str]]:
-            source_label = source_language or "the speaker's language"
-            system = (
-                "You are a live subtitle translator. Translate the CURRENT "
-                f"segment from hindi into {target_language}. "
-                "PREVIOUS segment is context only (pronouns, tense, topic): "
-                "do NOT re-translate or repeat them. Return ONLY the translated "
-                "current segment, with no quotes, no explanations, and no extra "
-                "sentences."
-                "The TRANSLATED SEGMENT is also provided which has the translation happened till now of the current given segment"
-            )
-            user = ""
-            previous = self._buffer.get_previous()
-            if previous:
-                user += "Previous segments (context only, do NOT re-translate):\n" + previous
-            if context:
-                user += "Translated segment " + self._buffer._current_translated + f"\n\nCurrent segment (translate this only):\n{text}"
-            else:
-                user = f"Translate this segment into {target_language}:\n{text}"
-            print("RollingSubtitleTranslator._build_messages called with system:", system)
-            return [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ]
-
-    async def _complete(self, messages: list[dict[str, str]]) -> str:
+    async def _complete(
+        self, messages: list[dict[str, str]], max_tokens: int | None = None
+    ) -> str:
         raise NotImplementedError
+
+    async def _complete_stream(
+        self,
+        messages: list[dict[str, str]],
+        on_chunk: Callable[[str], Awaitable[None]],
+        max_tokens: int | None = None,
+    ) -> str:
+        translated = await self._complete(messages, max_tokens)
+        if translated:
+            await on_chunk(translated)
+        return translated
+
+    @staticmethod
+    def _max_tokens_for(segment: str) -> int:
+        return max(64, min(1024, int(len(segment) * 1.5) + 16))
 
     async def translate(
         self,
@@ -195,36 +212,37 @@ class RollingSubtitleTranslator:
         item_id: str = "",
         on_chunk: Callable[[str], Awaitable[None]] | None = None,
     ) -> str | None:
-        print(f"translation_called", text)
         if not text or not text.strip():
             return text
         key = item_id or ""
-        fragment = self._buffer.add_fragment(text)
-        print("RollingSubtitleTranslator.translate called with text:", fragment)
-        if not fragment:
-            return None
-        text, context = fragment
-        messages = self._build_messages_deque(text, context, target_language, source_language)
-        print("translation_message", messages)
+        if not store:
+            self._buffer.add(key, text)
+            segment = self._buffer.take_ready(key)
+            if not segment:
+                return None
+        else:
+            segment = self._buffer.take_all(key, fallback=text)
+            if not segment.strip():
+                return segment
+        messages = self._build_messages(segment, target_language, source_language)
+        max_tokens = self._max_tokens_for(segment)
+        print("messages_context", messages)
         try:
             if on_chunk is None:
-                translated = (await self._complete(messages)).strip()
+                translated = (await self._complete(messages, max_tokens)).strip()
             else:
                 translated = (
-                    await self._complete_stream(messages, on_chunk)
+                    await self._complete_stream(messages, on_chunk, max_tokens)
                 ).strip()
-                print("Translated_segment", translated)
-            self._buffer.set_translation(translated)
+            print("translated_from_ds", translated)
         except Exception:
-            print(f"Exception occured on {text}")
-            self._buffer.put_back(key, text)
+            self._buffer.put_back(key, segment)
             raise
         if not translated:
-            # self._buffer.put_back(key, text)
-            return text
-        if self._context_segments > 0:
-            self._history.append((text, translated))
-        print("RollingSubtitleTranslator.translate returning translated:", translated)
+            self._buffer.put_back(key, segment)
+            return segment
+        if store and self._context_segments > 0:
+            self._history.append((segment, translated))
         return translated
 
 
@@ -235,8 +253,10 @@ class DeepseekFlashSubtitleTranslator(RollingSubtitleTranslator):
     over ``httpx`` (already a project dependency). ``model`` defaults to
     ``deepseek-flash`` and is passed through verbatim so a rename only
     needs a config change. An ``http_client`` with a ``post`` method may
-    be injected for tests; otherwise a fresh ``httpx.AsyncClient`` is
-    used per call and closed afterwards.
+    be injected for tests; otherwise one ``httpx.AsyncClient`` is
+    created lazily and reused for the translator's lifetime (keep-alive
+    avoids a TLS handshake per segment). Call :meth:`aclose` at session
+    end. An injected client is never closed here.
     """
 
     name = PROVIDER_DEEPSEEK
@@ -259,6 +279,24 @@ class DeepseekFlashSubtitleTranslator(RollingSubtitleTranslator):
         except (TypeError, ValueError):
             self._timeout = 15.0
         self._http_client = http_client
+        self._owned_client: Any | None = None
+
+    def _client(self) -> Any:
+        if self._http_client is not None:
+            return self._http_client
+        if self._owned_client is None:
+            import httpx
+
+            self._owned_client = httpx.AsyncClient(timeout=self._timeout)
+        return self._owned_client
+
+    async def aclose(self) -> None:
+        if self._owned_client is not None:
+            try:
+                await self._owned_client.aclose()
+            except Exception:
+                pass
+            self._owned_client = None
 
     def configure_buffer(self, settings: Any) -> None:
         self._buffer.configure(
@@ -271,141 +309,124 @@ class DeepseekFlashSubtitleTranslator(RollingSubtitleTranslator):
     def model(self) -> str:
         return self._model
 
-    async def _complete(self, messages: list[dict[str, str]]) -> str:
-        print("DeepseekFlashSubtitleTranslator._complete called with messages:", messages)
+    def _url(self) -> str:
+        return f"{self._base_url}/chat/completions"
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._api_key}"}
+
+    def _payload(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        stream: bool,
+        max_tokens: int | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": 0.0,
+            "stream": stream,
+            "thinking": {"type": "disabled"}
+        }
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+        return payload
+
+    def _require_key(self) -> None:
         if not self._api_key:
             raise SubtitleError(
                 code="not_configured",
                 message="subtitle service is not configured",
             )
-        url = f"{self._base_url}/chat/completions"
-        headers = {"Authorization": f"Bearer {self._api_key}"}
-        payload = {
-            "model": self._model,
-            "messages": messages,
-            "temperature": 0.0,
-            "stream": False,
-        }
-        client = self._http_client
-        owns_client = False
-        if client is None:
-            import httpx
 
-            client = httpx.AsyncClient()
-            owns_client = True
+    async def _complete(
+        self, messages: list[dict[str, str]], max_tokens: int | None = None
+    ) -> str:
+        self._require_key()
+        client = self._client()
         try:
-            try:
-                response = await client.post(
-                    url, headers=headers, json=payload, timeout=self._timeout
-                )
-            except Exception as exc:
-                raise SubtitleError(
-                    code="upstream_error",
-                    message="subtitle service unavailable",
-                ) from exc
-            try:
-                response.raise_for_status()
-            except Exception as exc:
-                raise SubtitleError(
-                    code="upstream_error",
-                    message="subtitle service unavailable",
-                ) from exc
-            try:
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-            except Exception as exc:
-                raise SubtitleError(
-                    code="upstream_error",
-                    message="subtitle service gave an invalid response",
-                ) from exc
-            if not isinstance(content, str) or not content.strip():
-                raise SubtitleError(
-                    code="upstream_error",
-                    message="subtitle service gave an empty response",
-                )
-            return content.strip()
-        finally:
-            if owns_client:
-                try:
-                    await client.aclose()
-                except Exception:
-                    pass
-
+            response = await client.post(
+                self._url(),
+                headers=self._headers(),
+                json=self._payload(messages, stream=False, max_tokens=max_tokens),
+                timeout=self._timeout,
+            )
+        except Exception as exc:
+            raise SubtitleError(
+                code="upstream_error", message="subtitle service unavailable"
+            ) from exc
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            raise SubtitleError(
+                code="upstream_error", message="subtitle service unavailable"
+            ) from exc
+        try:
+            content = response.json()["choices"][0]["message"]["content"]
+        except Exception as exc:
+            raise SubtitleError(
+                code="upstream_error",
+                message="subtitle service gave an invalid response",
+            ) from exc
+        if not isinstance(content, str) or not content.strip():
+            raise SubtitleError(
+                code="upstream_error",
+                message="subtitle service gave an empty response",
+            )
+        return content.strip()
 
     async def _complete_stream(
         self,
         messages: list[dict[str, str]],
         on_chunk: Callable[[str], Awaitable[None]],
+        max_tokens: int | None = None,
     ) -> str:
-        if not self._api_key:
-            raise SubtitleError(
-                code="not_configured",
-                message="subtitle service is not configured",
-            )
-        url = f"{self._base_url}/chat/completions"
-        headers = {"Authorization": f"Bearer {self._api_key}"}
-        payload = {
-            "model": self._model,
-            "messages": messages,
-            "temperature": 0.0,
-            "stream": True,
-        }
-        client = self._http_client
-        owns_client = False
-        if client is None:
-            import httpx
-
-            client = httpx.AsyncClient()
-            owns_client = True
+        self._require_key()
+        client = self._client()
+        full_parts: list[str] = []
         try:
-            try:
-                async with client.stream(
-                    "POST",
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=self._timeout,
-                ) as response:
+            async with client.stream(
+                "POST",
+                self._url(),
+                headers=self._headers(),
+                json=self._payload(messages, stream=True, max_tokens=max_tokens),
+                timeout=self._timeout,
+            ) as response:
+                try:
+                    response.raise_for_status()
+                except Exception as exc:
+                    raise SubtitleError(
+                        code="upstream_error",
+                        message="subtitle service unavailable",
+                    ) from exc
+                async for line in response.aiter_lines():
+                    stripped = line.strip()
+                    print("stripped_ds", stripped)
+                    if not stripped or not stripped.startswith("data:"):
+                        continue
+                    data = stripped[5:].strip()
+                    if data == "[DONE]":
+                        break
                     try:
-                        response.raise_for_status()
+                        piece = json.loads(data)["choices"][0]["delta"].get(
+                            "content", ""
+                        )
                     except Exception as exc:
                         raise SubtitleError(
                             code="upstream_error",
-                            message="subtitle service unavailable",
+                            message="subtitle service gave an invalid response",
                         ) from exc
-                    full_parts: list[str] = []
-                    async for line in response.aiter_lines():
-                        stripped = line.strip()
-                        if not stripped or not stripped.startswith("data:"):
-                            continue
-                        data = stripped[5:].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(data)
-                            piece = event["choices"][0]["delta"].get("content", "")
-                        except Exception as exc:
-                            raise SubtitleError(
-                                code="upstream_error",
-                                message="subtitle service gave an invalid response",
-                            ) from exc
-                        if not piece:
-                            continue
-                        full_parts.append(piece)
-                        await on_chunk(piece)
-            except SubtitleError:
-                raise
-            except Exception as exc:
-                raise SubtitleError(
-                    code="upstream_error",
-                    message="subtitle service unavailable",
-                ) from exc
-        finally:
-            if owns_client:
-                try:
-                    await client.aclose()
-                except Exception:
-                    pass
+                    if not piece:
+                        continue
+                    full_parts.append(piece)
+                    await on_chunk(piece)
+        except SubtitleError:
+            raise
+        except Exception as exc:
+            raise SubtitleError(
+                code="upstream_error", message="subtitle service unavailable"
+            ) from exc
         return "".join(full_parts)
 
 
@@ -419,13 +440,6 @@ class SubtitleSegmentBuffer:
     ) -> None:
         self._min_chars = max(0, int(min_chars))
         self._max_chars = max(0, int(max_chars))
-        self._max_current = 50
-        self._prev_budget = 50
-        self._offset = 10
-        self._current_original = ""
-        self._current_translated = ""
-        self._previous = deque()
-        self._seq = 0
         try:
             self._flush_seconds = float(flush_seconds)
         except (TypeError, ValueError):
@@ -471,50 +485,6 @@ class SubtitleSegmentBuffer:
         if current and not current[-1].isspace() and not fragment[0].isspace():
             current += " "
         entry[0] = current + fragment
-
-    def add_fragment(self, text: str):
-        """Returns (seq, context, chunk) when a chunk is ready, otherwise None."""
-        self._current_original += text
-        if text.strip() and not len(self._current_original)%self._offset:
-            return self.flush()
-        return None
-
-    def flush(self):
-        """Call this directly on a VAD pause so trailing words don't stall."""
-        print("Flush_called")
-        if not self._current_original:
-            return None
-
-        # if self._ends_sentence(self._current_original) or len(self._current_original) >= self._max_current:
-        #     self._current_original = ""
-
-        # Build context BEFORE adding this chunk, so it only contains older chunks
-        # idx = max(0, len(self._current_original)-self._offset-1)
-        # to_translate =  self._current_original[idx:]
-        context = self._current_translated
-
-        print(f"COntestxt: {self._current_original} || {context}")
-        # Move the chunk into previous now (tgt=None until the translation returns)
-        return self._current_original, context
-
-    def set_translation(self, tgt: str):
-        """Call when the translator responds, so later calls get the translated context."""
-        self._current_translated += f" {tgt}"
-        print("vdsvsvds", self._current_translated)
-        if self._ends_sentence(self._current_original) or len(self._current_original) >= self._max_current:
-            self._previous.append([self._current_original, self._current_translated])
-            self._trim_previous()
-            self._current_original = ""
-            self._current_translated = ""
-        
-    def _trim_previous(self):
-        # Drop whole chunks from the left, never partial ones
-        while len(self._previous) > self._prev_budget:
-            self._previous.popleft()
-
-    def get_previous(self):
-        return "\n".join(f"{segment[0]} => {segment[1]}" for segment in self._previous)
-
 
     def take_ready(self, item_id: str, *, now: float | None = None) -> str:
         entry = self._items.get(item_id)

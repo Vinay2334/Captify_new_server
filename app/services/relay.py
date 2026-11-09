@@ -245,6 +245,17 @@ class RelaySession:
                     task.cancel()
             await asyncio.gather(c2u, u2c, return_exceptions=True)
             await self._close_both()
+            await self._close_subtitle()
+
+    # Subtitle translator lifecycle.
+    async def _close_subtitle(self) -> None:
+        aclose = getattr(self._subtitle, 'aclose', None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:
+                pass
+
     async def _close_both(self) -> None:
         for sock in (self._client, self._upstream):
             try:
