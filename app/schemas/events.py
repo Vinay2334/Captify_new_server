@@ -18,7 +18,10 @@ keeps working.
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+# Session modes the extension can request per session.
+SessionMode = Literal["translation", "transcription"]
 
 
 # --- client -> backend ---
@@ -51,17 +54,47 @@ class UpstreamAudioCommitEvent(BaseModel):
 
 
 class LanguageConfigEvent(BaseModel):
-    """Per-session language selection sent by the extension.
+    """Per-session mode/language selection sent by the extension.
 
-    ``target_lang`` is forwarded upstream as a ``session.update`` output
-    language. ``source_lang`` is accepted for forward compatibility but
-    currently unused: the translation session always auto-detects the
-    source language and the API exposes no source-language field.
+    ``mode`` picks translation vs transcription for the session. In
+    translation mode ``target_lang`` is forwarded upstream as a
+    ``session.update`` output
+    language; in transcription mode it is unused and may be omitted.
+    The source language is never taken from the client: the upstream
+    model auto-detects it. ``source_lang`` is accepted only for backward
+    compatibility with older extension builds and is ignored except
+    that a legacy source == target pair still implies transcription.
     """
 
     type: Literal["language-config"]
-    source_lang: str = Field(min_length=1)
-    target_lang: str = Field(min_length=1)
+    mode: SessionMode | None = None
+    # Deprecated: accepted from older builds only; never used to pick a
+    # source language (the upstream model auto-detects it).
+    source_lang: str | None = None
+    target_lang: str | None = None
+
+    @model_validator(mode="after")
+    def _target_required_unless_transcribing(self) -> "LanguageConfigEvent":
+        if self.effective_mode == "translation" and not (
+            self.target_lang or ""
+        ).strip():
+            raise ValueError(
+                "target_lang is required in translation mode"
+            )
+        return self
+
+    @property
+    def effective_mode(self) -> SessionMode:
+        """Requested mode, deriving legacy source==target picks."""
+        if self.mode is not None:
+            return self.mode
+        if (
+            self.source_lang
+            and self.target_lang
+            and is_same_language(self.source_lang, self.target_lang)
+        ):
+            return "transcription"
+        return "translation"
 
 
 CLIENT_EVENT_TYPES = {

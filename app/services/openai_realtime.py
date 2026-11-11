@@ -73,6 +73,11 @@ def build_transcription_session_update(
     same downstream ``transcript.delta`` / ``transcript.completed``
     stream the extension renders for translations.
     """
+    transcription: dict[str, Any] = {"model": model}
+    if languages:
+        transcription["languages"] = list(languages)
+    # No "languages" key at all means auto-detect: the upstream API
+    # rejects an empty list with an "empty_array" error.
     return json.dumps(
         {
             "type": "session.update",
@@ -81,10 +86,7 @@ def build_transcription_session_update(
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcm", "rate": 24000},
-                        "transcription": {
-                            "model": model,
-                            "languages": list(languages) if languages else [],
-                        },
+                        "transcription": transcription,
                         "turn_detection": None,
                     }
                 },

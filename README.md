@@ -21,10 +21,15 @@ Two client transports are supported; both feed the same upstream session.
 
 ## Translation behavior
 
-- Source language is auto-detected; the target language defaults to
+- Session mode is picked per session in the extension's Mode dropdown
+  (`translation` / `transcription`). Source language is always
+  auto-detected by the model (the extension no longer sends one); the
+  target language defaults to
   `OPENAI_TRANSLATION_TARGET_LANGUAGE` (`en`). The extension can switch
   it per session by sending
-  `{"type": "language-config", "source_lang": "...", "target_lang": "es"}`:
+  `{"type": "language-config", "mode": "translation", "target_lang": "es"}`
+  (transcription sends just `{"type": "language-config", "mode": "transcription"}`,
+  no target, and captions stay in the auto-detected source language):
   `target_lang` is forwarded upstream as a `session.update` (repeats for
   the same language are skipped).
 - Transcribe mode: set `TRANSCRIBE_MODE=true` to transcribe every session
@@ -33,7 +38,7 @@ Two client transports are supported; both feed the same upstream session.
   same `transcript.delta` / `transcript.completed` stream, so the extension
   protocol is unchanged; `session.ready` and `/api/v1/health` report the
   transcription model.
-- Same-language sessions transcribe instead of translating: the
+- Legacy same-language picks transcribe instead of translating: the
   translation model omits same-language audio, which would otherwise
   break subtitles. When `source_lang` matches `target_lang` (for example
   English captions for English audio), the backend routes audio chunks

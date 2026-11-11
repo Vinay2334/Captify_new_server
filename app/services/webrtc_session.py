@@ -138,6 +138,11 @@ class WebRTCRelaySession:
             settings.translation_target_language,
         )
         self._transcription_languages = settings.transcription_language_hint()
+        # Mode explicitly requested by the extension for this session
+        # ("translation" / "transcription"); None until it asks. An
+        # explicit transcription request disables subtitle translation
+        # so captions stay in the auto-detected source language.
+        self._session_mode: str | None = None
         # Target language already applied upstream by the initial
         # session.update sent at connect time. Repeat language-config
         # events for the same language are skipped, never re-sent.
@@ -273,33 +278,56 @@ class WebRTCRelaySession:
     async def _apply_language_config(
         self, event: LanguageConfigEvent
     ) -> str | None:
-        """Forward a target-language change upstream. Returns stop reason."""
-        self._update_subtitle_target(event.target_lang)
-        self._subtitle_source = event.source_lang or self._subtitle_source
+        """Apply a mode/language change upstream. Returns stop reason."""
+        mode = event.effective_mode
+        if event.mode is None and self._settings.transcribe_mode:
+            # Legacy clients without a mode keep the deployment switch.
+            mode = "transcription"
+        self._session_mode = mode
+        if mode == "transcription":
+            # Source is auto-detected upstream: no hint and no target.
+            self._subtitle_source = None
+            if self._workflow.name == "soniox":
+                return self._apply_soniox_transcription_config(None)
+            return await self._apply_transcription_config(None)
+        target = (
+            event.target_lang or self._settings.translation_target_language
+        )
+        self._update_subtitle_target(target)
+        # Translation also auto-detects the source; only target is set.
+        # Legacy picks keep their source for subtitle context only.
+        self._subtitle_source = (
+            None
+            if event.mode is not None
+            else (event.source_lang or self._subtitle_source)
+        )
+        if self._settings.transcribe_mode and getattr(
+            self._subtitle, "enabled", False
+        ):
+            # This deployment transcribes upstream and translates the
+            # subtitle text instead: keep transcribing (auto-detected
+            # source) and let _maybe_translate_subtitle render target.
+            return await self._apply_transcription_config(None)
         if self._workflow.name == "soniox":
             return self._apply_soniox_language_config(event)
-        if self._settings.transcribe_mode or is_same_language(
-            event.source_lang, event.target_lang
-        ):
-            return await self._apply_transcription_config(event.source_lang)
         if (
-            event.target_lang == self._applied_target_language
+            target == self._applied_target_language
             and not self._transcription_mode
         ):
-            log.debug("language unchanged target=%s", event.target_lang)
+            log.debug("language unchanged target=%s", target)
             return None
         payload = build_session_update(
-            event.target_lang,
+            target,
             self._settings.translation_transcription_model,
         )
         ok = await self._forward_upstream(payload)
         if not ok:
             return "upstream_send_failed"
         self._transcription_mode = False
-        self._applied_target_language = event.target_lang
+        self._applied_target_language = target
         log.info(
             "webrtc translation target language updated target=%s",
-            event.target_lang,
+            target,
         )
         return None
 
@@ -316,6 +344,10 @@ class WebRTCRelaySession:
 
     async def _maybe_translate_subtitle(self, mapped: Any) -> Any:
         if not self._transcription_mode:
+            return mapped
+        if self._session_mode == "transcription":
+            # Explicit transcription: captions are verbatim in the
+            # auto-detected source language, never text-translated.
             return mapped
         if not getattr(self._subtitle, "enabled", False):
             return mapped
@@ -382,46 +414,67 @@ class WebRTCRelaySession:
             transcript=translated, item_id=mapped.item_id
         )
 
-    async def _apply_transcription_config(self, source_lang: str) -> str | None:
-        """Forward a transcription language hint upstream. Returns stop reason."""
+    async def _apply_transcription_config(
+        self, source_lang: str | None
+    ) -> str | None:
+        """Forward a transcription config upstream. Returns stop reason.
+
+        ``source_lang=None`` sends an empty language list so the model
+        auto-detects the spoken language instead of being hinted.
+        """
+        languages = [source_lang] if source_lang else []
         if self._workflow.name == "soniox":
             return self._apply_soniox_transcription_config(source_lang)
-        if self._transcription_mode and [source_lang] == self._transcription_languages:
+        if self._transcription_mode and languages == self._transcription_languages:
             log.debug("transcription language unchanged hint=%s", source_lang)
             return None
         payload = build_transcription_session_update(
-            self._settings.openai_transcription_model, [source_lang]
+            self._settings.openai_transcription_model, languages
         )
         ok = await self._forward_upstream(payload)
         if not ok:
             return "upstream_send_failed"
         self._transcription_mode = True
-        self._transcription_languages = [source_lang]
-        log.info("transcription language hint updated hint=%s", source_lang)
+        self._transcription_languages = languages
+        log.info(
+            "transcription language hint updated hint=%s",
+            source_lang or "auto",
+        )
         return None
 
     def _apply_soniox_language_config(self, event: LanguageConfigEvent) -> str | None:
         """Track target switches for Soniox (target is fixed at connect)."""
-        if self._settings.transcribe_mode or is_same_language(
-            event.source_lang, event.target_lang
-        ):
+        if event.effective_mode == "transcription":
             self._transcription_mode = True
-            self._transcription_languages = [event.source_lang]
-            log.info("transcription language hint updated hint=%s", event.source_lang)
+            self._transcription_languages = (
+                [event.source_lang] if event.source_lang else []
+            )
+            log.info(
+                "transcription language hint updated hint=%s",
+                event.source_lang or "auto",
+            )
         else:
             self._transcription_mode = False
-            self._applied_target_language = event.target_lang
+            self._applied_target_language = (
+                event.target_lang
+                or self._settings.translation_target_language
+            )
             log.info(
                 "webrtc translation target language updated target=%s",
-                event.target_lang,
+                self._applied_target_language,
             )
         return None
 
-    def _apply_soniox_transcription_config(self, source_lang: str) -> str | None:
+    def _apply_soniox_transcription_config(
+        self, source_lang: str | None
+    ) -> str | None:
         """Track transcription hints for Soniox (fixed at connect)."""
         self._transcription_mode = True
-        self._transcription_languages = [source_lang]
-        log.info("transcription language hint updated hint=%s", source_lang)
+        self._transcription_languages = [source_lang] if source_lang else []
+        log.info(
+            "transcription language hint updated hint=%s",
+            source_lang or "auto",
+        )
         return None
 
     async def _forward_upstream(self, payload: str) -> bool:
