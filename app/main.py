@@ -7,8 +7,10 @@ from fastapi import FastAPI
 
 from app.api.websocket import build_upstream_client, router
 from app.api.webrtc import router as webrtc_router
+from app.api.quota import router as quota_router
 from app.core.config import Settings, settings as default_settings
 from app.core.logging import configure_logging, get_logger
+from app.services.quota import build_quota_store
 
 log = get_logger(__name__)
 
@@ -20,10 +22,16 @@ async def lifespan(app: FastAPI):
             "translation API key is not set: translation sessions will be "
             "rejected until it is configured"
         )
-    log.warning(
-        "translation endpoint has no user authentication: anyone able to "
-        "reach it may consume OpenAI API quota; keep it on localhost"
-    )
+    if not app.state.settings.auth_enabled():
+        log.warning(
+            "translation endpoint has no user authentication: anyone able to "
+            "reach it may consume OpenAI API quota; keep it on localhost"
+        )
+    else:
+        log.info(
+            "user authentication enabled; quota enforcement=%s",
+            app.state.settings.quota_enforced(),
+        )
     yield
     peers = list(getattr(app.state, "webrtc_peers", set()))
     for pc in peers:
@@ -47,9 +55,11 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     app.state.active_sessions = 0
     app.state.webrtc_peers = set()
     app.state.background_tasks = set()
+    app.state.quota_store = build_quota_store(resolved)
     app.state.upstream_factory = lambda: build_upstream_client(resolved)
     app.include_router(router)
     app.include_router(webrtc_router)
+    app.include_router(quota_router)
 
     @app.get("/api/v1/health")
     async def health() -> dict:

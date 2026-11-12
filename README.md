@@ -82,6 +82,18 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 Copy `.env.example` to `.env` and set `OPENAI_API_KEY`.
 
+## Authentication + quota (Supabase)
+
+When `SUPABASE_URL` is set, the WebSocket and WebRTC transports require a
+verified Supabase access token and every subtitle session is billed in
+whole seconds against the user's quota (`Remaining = limit - used`).
+Without it the endpoints keep the open local-dev behavior above.
+
+- Schema + RLS + atomic RPCs: `supabase/migrations/0001_auth_quota.sql`
+- Setup (Google OAuth, extension config, dashboard plan changes):
+  `SUPABASE_SETUP.md`
+- Quota tests: `tests/test_auth_quota.py`
+
 ## Tests
 
 ```

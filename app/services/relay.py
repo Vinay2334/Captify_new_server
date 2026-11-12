@@ -45,6 +45,7 @@ from app.services.openai_realtime import (
     build_session_update,
     build_transcription_session_update,
 )
+from app.services.quota import SessionQuotaTracker
 
 log = get_logger(__name__)
 
@@ -134,10 +135,12 @@ class RelaySession:
         upstream: UpstreamSocket,
         settings: Settings,
         subtitle: Any | None = None,
+        quota: SessionQuotaTracker | None = None,
     ) -> None:
         self._client = client
         self._upstream = upstream
         self._settings = settings
+        self._quota = quota
         self._workflow = STTWorkflowFactory.get_workflow(settings)
         self._subtitle = subtitle or SubtitleFactory.get_translator(settings)
         self._subtitle_target_language = settings.translation_target_language
@@ -224,9 +227,23 @@ class RelaySession:
         u2c = asyncio.create_task(
             self._upstream_to_client(), name="relay-upstream-to-client"
         )
+        tasks = {c2u, u2c}
+        if self._quota is not None:
+            # Push the opening quota state right after session.ready so
+            # the extension UI shows live numbers from the first second.
+            try:
+                await self._client.send_text(
+                    json.dumps(self._quota.quota_event())
+                )
+            except Exception:
+                pass
+            watch = asyncio.create_task(
+                self._quota_watch(), name="relay-quota-watch"
+            )
+            tasks = {c2u, u2c, watch}
         try:
             done, _ = await asyncio.wait(
-                {c2u, u2c}, return_when=asyncio.FIRST_COMPLETED
+                tasks, return_when=asyncio.FIRST_COMPLETED
             )
             reason = "closed"
             for task in done:
@@ -243,14 +260,57 @@ class RelaySession:
                     reason = f"relay_error:{type(exc).__name__}"
             self._log_audio_progress(force=True)
             self._log_session_summary(reason)
+            if self._quota is not None:
+                await self._finish_quota(reason)
             return reason
         finally:
-            for task in (c2u, u2c):
+            for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(c2u, u2c, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
             await self._close_both()
             await self._close_subtitle()
+
+    async def _quota_watch(self) -> str:
+        """Cut the session off once remaining quota hits zero."""
+        assert self._quota is not None
+        interval = max(self._settings.quota_refresh_seconds, 1.0)
+        while True:
+            await asyncio.sleep(interval)
+            snapshot = await self._quota.maybe_refresh(force=True)
+            try:
+                await self._client.send_text(
+                    json.dumps(self._quota.quota_event())
+                )
+            except Exception:
+                return "client_disconnected"
+            if snapshot.remaining_seconds <= 0:
+                await self._send_client_error(
+                    "quota_exceeded",
+                    "Subtitle quota exhausted. Upgrade your plan to continue.",
+                )
+                try:
+                    await self._client.close(code=1008, reason="quota exceeded")
+                except Exception:
+                    pass
+                return "quota_exceeded"
+
+    async def _finish_quota(self, reason: str) -> None:
+        """Commit billed seconds exactly once, then report the result."""
+        assert self._quota is not None
+        try:
+            final = await self._quota.finish(reason)
+        except Exception as exc:
+            log.warning("quota finish failed type=%s", type(exc).__name__)
+            return
+        if final is None:
+            return
+        try:
+            await self._client.send_text(
+                json.dumps({"type": "quota.update", **final.to_dict()})
+            )
+        except Exception:
+            pass
 
     # Subtitle translator lifecycle.
     async def _close_subtitle(self) -> None:
@@ -593,6 +653,10 @@ class RelaySession:
                     continue
                 self._audio_chunks += 1
                 self._audio_bytes += size
+                # Bill only audio the relay kept (validated, under the
+                # rate limit). Dropped chunks never reach this line.
+                if self._quota is not None:
+                    self._quota.add_audio_bytes(size)
                 if self._audio_chunks == 1:
                     log.info(
                         "audio stream started first_chunk=%dB type=%s",
@@ -678,3 +742,9 @@ class RelaySession:
                 await self._client.send_text(mapped.model_dump_json())
             except Exception:
                 return "client_disconnected"
+            # A transcript reached the extension: this session generated
+            # subtitles, so its audio time counts as usage at commit.
+            if self._quota is not None and isinstance(
+                mapped, (TranscriptDeltaEvent, TranscriptCompletedEvent)
+            ):
+                self._quota.note_transcript()

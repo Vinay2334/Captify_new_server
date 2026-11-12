@@ -117,6 +117,33 @@ class Settings(BaseSettings):
         default=2.0, alias="SUBTITLE_FLUSH_SECONDS"
     )
 
+    # --- Supabase authentication + quota management ---
+    # Empty SUPABASE_URL keeps the previous local-dev behavior: endpoints
+    # stay open (see lifespan warning in app.main). Setting SUPABASE_URL
+    # (plus a JWT secret or JWKS) turns authentication and quota
+    # enforcement on for both transports.
+    supabase_url: str = Field(default="", alias="SUPABASE_URL")
+    # Service role key: backend only, never sent to the extension. Used
+    # for quota reads/writes (bypasses RLS by design).
+    supabase_service_role_key: str = Field(
+        default="", alias="SUPABASE_SERVICE_ROLE_KEY"
+    )
+    # HS256 JWT secret (Supabase dashboard -> project settings -> API).
+    # When set, tokens are verified locally with it. When empty but
+    # SUPABASE_URL is set, tokens are verified against the project's
+    # JWKS document (RS256/ES256, current Supabase default).
+    supabase_jwt_secret: str = Field(default="", alias="SUPABASE_JWT_SECRET")
+    supabase_jwks_url: str = Field(default="", alias="SUPABASE_JWKS_URL")
+    # Seconds of remaining quota required to start a session. Default 1:
+    # any positive remainder may start; the session is cut off at zero.
+    quota_min_start_seconds: int = Field(
+        default=1, alias="QUOTA_MIN_START_SECONDS"
+    )
+    # How often a running session re-reads remaining quota (seconds).
+    quota_refresh_seconds: float = Field(
+        default=5.0, alias="QUOTA_REFRESH_SECONDS"
+    )
+
     # Client-facing WebSocket limits.
     # Comma-separated origins, or "*" to allow any origin (local dev default).
     # Origin checks are NOT authentication.
@@ -228,6 +255,21 @@ class Settings(BaseSettings):
     def is_soniox_provider(self) -> bool:
         """Whether sessions route through Soniox instead of OpenAI."""
         return self.stt_provider == "soniox"
+
+    def auth_enabled(self) -> bool:
+        """Whether Supabase auth/quota enforcement is on."""
+        return bool(self.supabase_url.strip())
+
+    def quota_enforced(self) -> bool:
+        """Whether subtitle time is billed against a user quota."""
+        return self.auth_enabled() and bool(
+            self.supabase_service_role_key.strip()
+        )
+
+    def resolved_jwks_url(self) -> str:
+        if self.supabase_jwks_url.strip():
+            return self.supabase_jwks_url.strip()
+        return f"{self.supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
 
     def upstream_api_key(self) -> str:
         """API key for the active provider (never sent to the extension)."""
