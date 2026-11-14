@@ -9,9 +9,10 @@ WebSocket.
 
 When the backend is configured with ``SUPABASE_URL`` the offer must
 carry the user's Supabase access token (``Authorization: Bearer`` header
-or ``token`` body field): the session is tied to the verified user and
-billed against their quota. Without Supabase configuration it keeps the
-previous local-development behavior. Session accounting mirrors the
+or ``token`` body field): the token is verified against Supabase before
+any other check, and only then is the session tied to the verified user
+and billed against their quota. Without Supabase configuration it keeps
+the previous local-development behavior. Session accounting mirrors the
 WebSocket endpoint: origin checks, one slot per session, one upstream
 socket per session. Origin checks and connection caps are resource
 protections, not access control.
@@ -100,6 +101,21 @@ async def _wait_ice_gathering_complete(pc: object, timeout: float = 5.0) -> None
 async def webrtc_offer(payload: OfferRequest, request: Request):
     settings: Settings = request.app.state.settings
 
+    # Identity gate FIRST. When Supabase Auth is configured, the caller's
+    # access token is verified against Supabase before any other check, so
+    # unauthenticated callers always get 401 and never consume slots, quota
+    # rows, or upstream sockets -- nor learn anything about server config
+    # (e.g. whether the API key is set) from later error codes.
+    user: AuthUser | None = None
+    quota: SessionQuotaTracker | None = None
+    if settings.auth_enabled():
+        token = extract_bearer(request) or (payload.token or "")
+        try:
+            user = verify_supabase_token(token, settings)
+        except AuthError as exc:
+            log.warning("webrtc offer rejected: auth failed code=%s", exc.code)
+            return _error(401, exc.code, exc.message)
+
     origin = request.headers.get("origin")
     if not settings.is_origin_allowed(origin):
         log.warning("webrtc offer rejected: disallowed origin")
@@ -111,18 +127,11 @@ async def webrtc_offer(payload: OfferRequest, request: Request):
             503, "not_configured", "translation service is not configured"
         )
 
-    # Identity + quota gate. Runs before a slot is consumed so rejected
-    # callers never hold one; the authorized tracker is finalized on every
-    # later failure path (0 billed when nothing was generated).
-    user: AuthUser | None = None
-    quota: SessionQuotaTracker | None = None
+    # Quota gate. Runs before a slot is consumed so rejected callers never
+    # hold one; the authorized tracker is finalized on every later failure
+    # path (0 billed when nothing was generated).
     if settings.auth_enabled():
-        token = extract_bearer(request) or (payload.token or "")
-        try:
-            user = verify_supabase_token(token, settings)
-        except AuthError as exc:
-            log.warning("webrtc offer rejected: auth failed code=%s", exc.code)
-            return _error(401, exc.code, exc.message)
+        assert user is not None
         client_session_id = (
             payload.client_session_id or f"rtc-{uuid.uuid4().hex}"
         )

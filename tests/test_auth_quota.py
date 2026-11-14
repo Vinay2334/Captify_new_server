@@ -323,3 +323,42 @@ def test_websocket_tracked_session_bills_audio_seconds():
     )
     assert used.used_seconds == 1
     assert used.remaining_seconds == 5999
+
+def test_webrtc_offer_auth_checked_before_api_key_config():
+    # Auth runs first: no token -> 401 even when the API key is missing
+    # (previously this returned 503 and leaked server config state).
+    client, _, _ = make_client(OPENAI_API_KEY="")
+    response = client.post(
+        "/api/v1/transcription/webrtc/offer",
+        json={"sdp": "v=0", "type": "offer", "client_session_id": "x"},
+    )
+    assert response.status_code == 401
+    assert response.json()["code"] == "auth_expired"
+
+
+def test_webrtc_offer_auth_checked_before_origin():
+    # Auth runs first: no token -> 401 even from a disallowed origin
+    # (previously 403).
+    client, _, _ = make_client(
+        ALLOWED_WEBSOCKET_ORIGINS="https://example.com"
+    )
+    response = client.post(
+        "/api/v1/transcription/webrtc/offer",
+        json={"sdp": "v=0", "type": "offer", "client_session_id": "x"},
+        headers={"origin": "https://evil.test"},
+    )
+    assert response.status_code == 401
+    assert response.json()["code"] == "auth_expired"
+
+
+def test_webrtc_offer_valid_token_passes_auth_gate():
+    # A valid token passes the auth gate: with no API key configured the
+    # request fails at the config check (503), not at auth.
+    client, _, _ = make_client(OPENAI_API_KEY="")
+    response = client.post(
+        "/api/v1/transcription/webrtc/offer",
+        headers={"Authorization": f"Bearer {make_token()}"},
+        json={"sdp": "v=0", "type": "offer", "client_session_id": "ok"},
+    )
+    assert response.status_code == 503
+    assert response.json()["code"] == "not_configured"
