@@ -41,7 +41,12 @@ Add to `Captify_new_server/.env` (see `.env.example`):
 SUPABASE_URL=https://YOUR-PROJECT.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=eyJ...service_role...
 # SUPABASE_JWT_SECRET=...   # only for legacy HS256 projects
+ENVIRONMENT=production
 ```
+
+`ENVIRONMENT=production` makes the backend refuse to boot without
+Supabase Auth, so anonymous (unbilled) subtitle time is impossible in
+any real deployment. Keep `development` only for local work.
 
 Restart: `uv run uvicorn app.main:app --host 127.0.0.1 --port 8000`.
 With `SUPABASE_URL` set, both transports require a verified token and bill
@@ -65,12 +70,17 @@ usage; without it they keep the previous open local-dev behavior.
    redirect URI.
 2. **Supabase → Authentication → Providers → Google**: enable, paste the
    Google client ID + secret.
-3. **Supabase → Authentication → URL Configuration**: add as Redirect URLs:
+3. **Supabase → Authentication → Providers**: keep only **Email** and
+   **Google** enabled. Leave **Anonymous** OFF — and even if it is ever
+   flipped on by accident, the backend rejects `is_anonymous` tokens
+   (`anonymous_disabled`) on every transport, so anonymous users can
+   never start sessions or consume quota.
+4. **Supabase → Authentication → URL Configuration**: add as Redirect URLs:
    - `https://YOUR-EXTENSION-ID.chromiumapp.org/` (from
      `chrome.identity.getRedirectURL()`; the ID is stable per installations
      from the same codebase, or use your Chrome Web Store ID)
    - `http://localhost:8000/**` (local testing only)
-4. In the overlay's sign-in gate, **Continue with Google** opens the
+5. The sign-in popup's **Continue with Google** opens the
    consent flow and returns to the extension with a Supabase session.
    If Google is not configured, email sign-up/sign-in works on its own
    (enable it under **Authentication → Providers → Email**; with

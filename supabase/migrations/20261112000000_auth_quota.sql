@@ -40,6 +40,8 @@ on conflict (id) do nothing;
 -- -------------------------------------------------------------- profiles ---
 create table if not exists public.profiles (
   user_id uuid primary key references auth.users (id) on delete cascade,
+  first_name text,
+  last_name text,
   plan_id text not null default 'free' references public.plans (id),
   quota_used_seconds integer not null default 0 check (quota_used_seconds >= 0),
   created_at timestamptz not null default now(),
@@ -80,8 +82,8 @@ begin
   if default_plan is null then
     select id into default_plan from public.plans order by quota_limit_seconds asc limit 1;
   end if;
-  insert into public.profiles (user_id, plan_id, quota_used_seconds)
-  values (new.id, coalesce(default_plan, 'free'), 0)
+  insert into public.profiles (user_id, first_name, last_name, plan_id, quota_used_seconds)
+  values (new.id, new.raw_user_meta_data ->> 'first_name', new.raw_user_meta_data ->> 'last_name', coalesce(default_plan, 'free'), 0)
   on conflict (user_id) do nothing;
   return new;
 end;

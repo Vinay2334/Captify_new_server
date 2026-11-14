@@ -98,7 +98,7 @@ async def transcription_ws(websocket: WebSocket) -> None:
         try:
             user = verify_websocket_user(websocket, settings)
         except AuthError as exc:
-            await _reject(websocket, "auth_expired", exc.message, 4401)
+            await _reject(websocket, exc.code, exc.message, 4401)
             log.warning("rejected websocket: auth failed")
             async with state.slot_lock:
                 state.active_sessions = max(0, state.active_sessions - 1)

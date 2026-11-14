@@ -117,11 +117,17 @@ class Settings(BaseSettings):
         default=2.0, alias="SUBTITLE_FLUSH_SECONDS"
     )
 
+    # Deployment environment. "development" (default) keeps the previous
+    # local-dev behavior when SUPABASE_URL is empty. "production" refuses
+    # to boot without Supabase Auth configured, so there is no deployment
+    # in which subtitle time can be consumed anonymously (and unbilled).
+    environment: str = Field(default="development", alias="ENVIRONMENT")
+
     # --- Supabase authentication + quota management ---
-    # Empty SUPABASE_URL keeps the previous local-dev behavior: endpoints
-    # stay open (see lifespan warning in app.main). Setting SUPABASE_URL
-    # (plus a JWT secret or JWKS) turns authentication and quota
-    # enforcement on for both transports.
+    # SUPABASE_URL must be set in any deployment that serves real users:
+    # it turns authentication and quota enforcement on for both
+    # transports. Leaving it empty keeps the local-dev behavior (open
+    # endpoints with a startup warning) and is rejected in production.
     supabase_url: str = Field(default="", alias="SUPABASE_URL")
     # Service role key: backend only, never sent to the extension. Used
     # for quota reads/writes (bypasses RLS by design).
@@ -255,6 +261,10 @@ class Settings(BaseSettings):
     def is_soniox_provider(self) -> bool:
         """Whether sessions route through Soniox instead of OpenAI."""
         return self.stt_provider == "soniox"
+
+    def is_production(self) -> bool:
+        """Whether this is a production deployment."""
+        return self.environment.strip().lower() == "production"
 
     def auth_enabled(self) -> bool:
         """Whether Supabase auth/quota enforcement is on."""

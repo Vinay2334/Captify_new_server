@@ -121,8 +121,8 @@ async def webrtc_offer(payload: OfferRequest, request: Request):
         try:
             user = verify_supabase_token(token, settings)
         except AuthError as exc:
-            log.warning("webrtc offer rejected: auth failed")
-            return _error(401, "auth_expired", exc.message)
+            log.warning("webrtc offer rejected: auth failed code=%s", exc.code)
+            return _error(401, exc.code, exc.message)
         client_session_id = (
             payload.client_session_id or f"rtc-{uuid.uuid4().hex}"
         )

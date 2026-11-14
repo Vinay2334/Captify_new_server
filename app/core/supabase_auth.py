@@ -43,9 +43,12 @@ class AuthUser:
 class AuthError(Exception):
     """Expected rejection: expired/invalid token (maps to 401/4401)."""
 
-    def __init__(self, message: str = "invalid or expired token") -> None:
+    def __init__(
+        self, message: str = "invalid or expired token", code: str = "auth_expired"
+    ) -> None:
         super().__init__(message)
         self.message = message
+        self.code = code
 
 
 def _jwks_client(jwks_url: str) -> jwt.PyJWKClient:
@@ -103,6 +106,14 @@ def verify_supabase_token(token: str, settings: Settings) -> AuthUser:
 
 
 def _to_auth_user(payload: dict) -> AuthUser:
+    # Only email and Google OAuth users are allowed: anonymous Supabase
+    # users carry is_anonymous=true and must never consume quota, even if
+    # the Anonymous provider is accidentally enabled in the dashboard.
+    if payload.get("is_anonymous") is True:
+        raise AuthError(
+            "Anonymous sign-in is disabled. Sign in with email or Google.",
+            code="anonymous_disabled",
+        )
     user_id = str(payload.get("sub") or "")
     if not user_id:
         raise AuthError("invalid token")

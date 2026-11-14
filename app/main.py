@@ -48,6 +48,13 @@ async def lifespan(app: FastAPI):
 
 def create_app(app_settings: Settings | None = None) -> FastAPI:
     resolved = app_settings or default_settings
+    if resolved.is_production() and not resolved.auth_enabled():
+        # Fail fast: a production deployment without Supabase Auth would
+        # serve subtitle time anonymously, which cannot be billed to quota.
+        raise RuntimeError(
+            "Refusing to start: ENVIRONMENT=production requires SUPABASE_URL "
+            "(and a JWT secret or JWKS) so every session is authenticated."
+        )
     configure_logging(resolved.log_level)
     app = FastAPI(title="Captify Translation Backend", lifespan=lifespan)
     app.state.settings = resolved

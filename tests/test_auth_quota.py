@@ -32,13 +32,19 @@ TEST_SECRET = "test-jwt-secret-for-captify-quota-tests"
 USER_ID = "11111111-2222-3333-4444-555555555555"
 
 
-def make_token(user_id: str = USER_ID, secret: str = TEST_SECRET, exp_in: int = 3600) -> str:
+def make_token(
+    user_id: str = USER_ID,
+    secret: str = TEST_SECRET,
+    exp_in: int = 3600,
+    anonymous: bool = False,
+) -> str:
     now = int(time.time())
-    return jwt.encode(
-        {"sub": user_id, "email": "user@captify.local", "iat": now, "exp": now + exp_in},
-        secret,
-        algorithm="HS256",
-    )
+    claims: dict = {"sub": user_id, "iat": now, "exp": now + exp_in}
+    if anonymous:
+        claims["is_anonymous"] = True
+    else:
+        claims["email"] = "user@captify.local"
+    return jwt.encode(claims, secret, algorithm="HS256")
 
 
 def make_settings(**overrides):
@@ -92,6 +98,32 @@ def test_expired_token_rejected():
 def test_missing_token_rejected():
     with pytest.raises(AuthError):
         verify_supabase_token("", make_settings())
+
+
+def test_anonymous_token_rejected():
+    with pytest.raises(AuthError) as exc_info:
+        verify_supabase_token(make_token(anonymous=True), make_settings())
+    assert exc_info.value.code == "anonymous_disabled"
+
+
+# --- anonymous access is impossible in production -------------------------------
+
+
+def test_production_refuses_to_boot_without_supabase():
+    settings = make_settings(ENVIRONMENT="production", SUPABASE_URL="")
+    with pytest.raises(RuntimeError):
+        create_app(settings)
+
+
+def test_production_boots_with_supabase_configured():
+    settings = make_settings(ENVIRONMENT="production")
+    assert create_app(settings) is not None
+
+
+def test_development_keeps_local_open_mode_without_supabase():
+    settings = make_settings(SUPABASE_URL="", SUPABASE_JWT_SECRET="")
+    assert create_app(settings) is not None
+    assert not settings.auth_enabled()
 
 
 # --- billing math ------------------------------------------------------------
@@ -223,6 +255,27 @@ def test_me_quota_returns_own_plan_and_usage():
     assert body["limit_seconds"] == 6000
     assert body["used_seconds"] == 0
     assert body["remaining_seconds"] == 6000
+
+
+def test_webrtc_offer_anonymous_token_rejected():
+    client, _, _ = make_client()
+    response = client.post(
+        "/api/v1/transcription/webrtc/offer",
+        headers={"Authorization": f"Bearer {make_token(anonymous=True)}"},
+        json={"sdp": "v=0", "type": "offer", "client_session_id": "anon"},
+    )
+    assert response.status_code == 401
+    assert response.json()["code"] == "anonymous_disabled"
+
+
+def test_websocket_anonymous_token_closed():
+    client, _, _ = make_client()
+    with client.websocket_connect(
+        f"/api/v1/transcription/ws?token={make_token(anonymous=True)}"
+    ) as ws:
+        msg = json.loads(ws.receive_text())
+        assert msg["type"] == "error"
+        assert msg["code"] == "anonymous_disabled"
 
 
 def test_websocket_without_token_closed_when_auth_on():
