@@ -1,27 +1,40 @@
-"""Logging setup.
-
-Never log audio payloads or API keys. Audio flow is visible through
-metadata only: chunk counts, decoded byte sizes, bytes/s rates, commit
-counts, and session summaries (see ``RelaySession``). Transcript text is
-logged at INFO so it is visible in the terminal during local development.
-"""
 
 import logging
 import sys
 
 _configured = False
 
+# Suppress noisy third-party networking logs
+THIRD_PARTY_LOGGERS = [
+    "aiortc",
+    "aioice",
+    "httpcore",
+    "httpx",
+    "websockets",
+    "asyncio",
+]
 
 def configure_logging(level: str = "INFO") -> logging.Logger:
     global _configured
+
+    log_level = getattr(logging, level.upper(), logging.INFO)
+
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"
+        )
     )
+
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)
-    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    root.setLevel(log_level)
+
+    # Explicitly control third-party loggers
+    for logger_name in THIRD_PARTY_LOGGERS:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
     _configured = True
     return logging.getLogger("captify")
 
