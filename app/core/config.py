@@ -150,6 +150,17 @@ class Settings(BaseSettings):
         default=5.0, alias="QUOTA_REFRESH_SECONDS"
     )
 
+    # --- Dodo Payments billing (webhook upgrades plan/quota) ---
+    # Signing secret for the Dodo webhook endpoint (Developer -> Webhooks
+    # in the Dodo dashboard; may start with "whsec_"). Empty disables the
+    # endpoint (it answers 503) so an undeployed secret can't bill anyone.
+    dodo_webhook_secret: str = Field(default="", alias="DODO_WEBHOOK_SECRET")
+    # Dodo product -> Supabase plans.id mapping, e.g.
+    # "prod_abc=pro,prod_xyz=studio". The free plan needs no product.
+    dodo_plan_map: str = Field(default="", alias="DODO_PLAN_MAP")
+    # Plan assigned when a subscription ends (cancelled / expired).
+    dodo_free_plan_id: str = Field(default="free", alias="DODO_FREE_PLAN_ID")
+
     # Client-facing WebSocket limits.
     # Comma-separated origins, or "*" to allow any origin (local dev default).
     # Origin checks are NOT authentication.
@@ -275,6 +286,29 @@ class Settings(BaseSettings):
         return self.auth_enabled() and bool(
             self.supabase_service_role_key.strip()
         )
+
+    def billing_enabled(self) -> bool:
+        """Whether the Dodo webhook endpoint can apply plan changes."""
+        return self.quota_enforced() and bool(self.dodo_webhook_secret.strip())
+
+    def dodo_plans(self) -> dict[str, str]:
+        """Dodo product id -> plans.id mapping from DODO_PLAN_MAP."""
+        mapping: dict[str, str] = {}
+        # Tolerate a fully-quoted value (DODO_PLAN_MAP="a=b,..." in .env):
+        # the quotes would otherwise become part of the first/last id and
+        # silently unmap every product.
+        raw = self.dodo_plan_map.strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+            raw = raw[1:-1]
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if not entry or "=" not in entry:
+                continue
+            product_id, _, plan_id = entry.partition("=")
+            product_id, plan_id = product_id.strip(), plan_id.strip()
+            if product_id and plan_id:
+                mapping[product_id] = plan_id
+        return mapping
 
     def resolved_jwks_url(self) -> str:
         if self.supabase_jwks_url.strip():

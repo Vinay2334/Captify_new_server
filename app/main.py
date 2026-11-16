@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from app.api.websocket import build_upstream_client, router
 from app.api.webrtc import router as webrtc_router
 from app.api.quota import router as quota_router
+from app.api.billing import router as billing_router
 from app.core.config import Settings, settings as default_settings
 from app.core.logging import configure_logging, get_logger
 from app.services.quota import build_quota_store
@@ -67,6 +68,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     app.include_router(router)
     app.include_router(webrtc_router)
     app.include_router(quota_router)
+    app.include_router(billing_router)
 
     @app.get("/api/v1/health")
     async def health() -> dict:

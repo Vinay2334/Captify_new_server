@@ -124,9 +124,24 @@ usage; without it they keep the previous open local-dev behavior.
 - Failed sessions (upstream error before any transcript, silent sessions,
   rejected audio) commit 0 seconds.
 
-## 8. Adding payments later
+## 8. Payments (Dodo) — implemented
 
-No quota-flow changes needed: add a `stripe_customer_id` column to
-`profiles`, new rows to `plans`, and a webhook endpoint that updates
-`profiles.plan_id` — `authorize`/`commit` and RLS already key off those
-tables.
+Billing is live in the backend; no quota-flow changes were needed:
+
+- `supabase/migrations/20261116000000_billing_plans.sql` adds the `pro`
+  (60,000 s) and `studio` (240,000 s) rows `website/index.html` sells.
+  Apply it with `supabase db push` (or paste it into the SQL editor).
+- `POST /api/v1/billing/dodo/webhook` (`app/api/billing.py`) verifies the
+  Standard Webhooks signature (`DODO_WEBHOOK_SECRET`), maps the Dodo
+  product to a plan (`DODO_PLAN_MAP`, e.g. `prod_abc=pro`), and writes
+  `profiles.plan_id` — by `metadata_user_id` from the checkout link first,
+  by customer-email lookup second. `subscription.cancelled` /
+  `subscription.expired` fall back to `DODO_FREE_PLAN_ID` (`free`).
+  `authorize`/`commit` and RLS already key off those tables, so the new
+  plan takes effect on the next session.
+- Webhook dashboard setup: Dodo → Developer → Webhooks → add
+  `https://YOUR-BACKEND/api/v1/billing/dodo/webhook` and copy the signing
+  secret into the backend `.env` (`DODO_WEBHOOK_SECRET`, `DODO_PLAN_MAP`;
+  see `.env.example`). Without a secret the endpoint answers 503.
+- Tests: `uv run pytest tests/test_billing.py` (hermetic — Supabase calls
+  are faked; no network).
