@@ -71,6 +71,12 @@ async def dodo_webhook(request: Request):
         )
 
     event = parse_dodo_event(payload, settings.dodo_plans())
+    log.info(
+        "dodo webhook received type=%s action=%s event=%s",
+        payload.get("type"),
+        event.action,
+        event.event_id,
+    )
     if event.action == "ignore":
         return JSONResponse(
             status_code=200, content={"ok": True, "action": "ignored"}
@@ -96,7 +102,8 @@ async def dodo_webhook(request: Request):
         )
         return JSONResponse(
             status_code=200,
-            content={"ok": True, "action": "ignored", "reason": "unknown_user"},
+            content={"ok": True, "action": "ignored",
+                     "reason": "unknown_user"},
         )
     try:
         applied = await set_user_plan(user_id, plan_id, settings)
