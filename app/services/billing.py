@@ -171,14 +171,7 @@ def parse_dodo_event(payload: dict, plan_map: dict[str, str]) -> BillingEvent:
 
     event = BillingEvent(
         action="ignore",
-        product_id=_dig(
-            data,
-            "product_id",
-            "product.product_id",
-            "subscription.product_id",
-            "payment.product_id",
-            "cart.product_id",
-        ),
+        product_id= metadata.get("plan_id"),
         user_id=_first_str(metadata.get("user_id"), metadata.get("userId")),
         email=_dig(
             data,

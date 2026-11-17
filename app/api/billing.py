@@ -75,7 +75,7 @@ async def dodo_webhook(request: Request):
         "dodo webhook received type=%s action=%s event=%s",
         payload.get("type"),
         event.action,
-        event.event_id,
+        event,
     )
     if event.action == "ignore":
         return JSONResponse(
