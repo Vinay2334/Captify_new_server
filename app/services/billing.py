@@ -171,7 +171,7 @@ def parse_dodo_event(payload: dict, plan_map: dict[str, str]) -> BillingEvent:
 
     event = BillingEvent(
         action="ignore",
-        product_id= metadata.get("plan_id"),
+        product_id= data.get("product_card")[0].get("product_id") if isinstance(data.get("product_card"), list) and len(data.get("product_card")) > 0 and isinstance(data.get("product_card")[0], dict) else None,
         user_id=_first_str(metadata.get("user_id"), metadata.get("userId")),
         email=_dig(
             data,
