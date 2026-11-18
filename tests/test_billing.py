@@ -170,6 +170,27 @@ def test_subscription_cancelled_deactivates():
     assert event.user_id == USER_ID
 
 
+def test_payment_succeeded_reads_product_cart():
+    # Real Dodo Payment payloads nest the product in product_cart[0];
+    # there is no top-level product_id on the data object.
+    event = parse_dodo_event(
+        {
+            "id": "evt_real",
+            "type": "payment.succeeded",
+            "data": {
+                "product_cart": [{"product_id": "prod_studio", "quantity": 1}],
+                "customer": {"email": "buyer@captify.local"},
+                "metadata": {"user_id": USER_ID, "plan_id": "studio"},
+            },
+        },
+        PLAN_MAP,
+    )
+    assert event == BillingEvent(
+        action="activate", product_id="prod_studio", plan_id="studio",
+        user_id=USER_ID, email="buyer@captify.local", event_id="evt_real",
+    )
+
+
 def test_unmapped_product_ignored():
     event = parse_dodo_event(
         {"type": "payment.succeeded",
@@ -288,6 +309,20 @@ def test_webhook_unknown_user_ignored(monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["reason"] == "unknown_user"
     assert "set_plan" not in calls
+
+
+def test_webhook_upgrades_product_cart_payment(monkeypatch):
+    client, calls = make_client(monkeypatch)
+    resp = post_webhook(client, {
+        "id": "evt_cart",
+        "type": "payment.succeeded",
+        "data": {"product_cart": [{"product_id": "prod_studio", "quantity": 1}],
+                  "customer": {"email": "buyer@captify.local"},
+                  "metadata": {"user_id": USER_ID, "plan_id": "studio"}},
+    })
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "action": "activate", "plan_id": "studio"}
+    assert calls["set_plan"] == (USER_ID, "studio")
 
 
 def test_webhook_unmapped_product_ignored(monkeypatch):

@@ -141,7 +141,23 @@ Billing is live in the backend; no quota-flow changes were needed:
   plan takes effect on the next session.
 - Webhook dashboard setup: Dodo → Developer → Webhooks → add
   `https://YOUR-BACKEND/api/v1/billing/dodo/webhook` and copy the signing
-  secret into the backend `.env` (`DODO_WEBHOOK_SECRET`, `DODO_PLAN_MAP`;
-  see `.env.example`). Without a secret the endpoint answers 503.
-- Tests: `uv run pytest tests/test_billing.py` (hermetic — Supabase calls
-  are faked; no network).
+  secret into the backend `.env` (see `.env.example`). Without a secret
+  the endpoint answers 503.
+- Browser access: the pricing site calls `GET /api/v1/plans` +
+  `GET /api/v1/me/quota` from the browser; put your deployed site origin
+  in `WEBSITE_ORIGINS` or the browser blocks them.
+
+## 8b. Plan catalog (pricing site reads this live)
+
+- `supabase/migrations/20261118000000_plan_catalog.sql` adds the display
+  columns (`price_monthly_usd`, `features`, `display_order`, `is_featured`)
+  and seeds them. Edit those columns in the dashboard to change the
+  site's plans with no redeploy (names, prices, features, order,
+  highlight); the seeds only fill columns still holding defaults, so
+  re-running never clobbers your edits. `GET /api/v1/plans` serves the
+  rows ordered for rendering plus each plan's Dodo product (from
+  `DODO_PLAN_MAP`); it answers 503 without a service-role key and 502
+  when Supabase is unreachable. Keep plan names unique: the site matches
+  the signed-in account's current plan by name (see `.env.example`).
+- Tests: `uv run pytest tests/test_billing.py tests/test_plans.py`
+  (hermetic — Supabase calls are faked; no network).

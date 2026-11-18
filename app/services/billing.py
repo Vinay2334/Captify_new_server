@@ -151,6 +151,31 @@ def _dig(data: object, *paths: str) -> str | None:
     return None
 
 
+def _first_cart_product(data: object) -> str | None:
+    """Product id of the first cart line, or None.
+
+    Real Dodo Payment payloads carry the product inside
+    ``product_cart`` (a list of ``{product_id, quantity}``) with no
+    top-level ``product_id`` on the data object. Single-product
+    checkouts — everything this endpoint activates — have exactly one
+    line; multi-product carts resolve to their first line. This is a
+    fallback: the dotted-path shapes (subscriptions, older envelopes)
+    keep priority via ``_dig``.
+    """
+    if not isinstance(data, dict):
+        return None
+    items = data.get("product_cart")
+    if not isinstance(items, list) or not items:
+        return None
+    first = items[0]
+    if not isinstance(first, dict):
+        return None
+    product_id = first.get("product_id")
+    if isinstance(product_id, str) and product_id.strip():
+        return product_id.strip()
+    return None
+
+
 def parse_dodo_event(payload: dict, plan_map: dict[str, str]) -> BillingEvent:
     """Normalize a Dodo webhook envelope into an actionable event.
 
@@ -171,7 +196,15 @@ def parse_dodo_event(payload: dict, plan_map: dict[str, str]) -> BillingEvent:
 
     event = BillingEvent(
         action="ignore",
-        product_id= data.get("product_cart")[0].get("product_id") if isinstance(data.get("product_cart"), list) and len(data.get("product_cart")) > 0 and isinstance(data.get("product_cart")[0], dict) else None,
+        product_id=_dig(
+            data,
+            "product_id",
+            "product.product_id",
+            "subscription.product_id",
+            "payment.product_id",
+            "cart.product_id",
+        )
+        or _first_cart_product(data),
         user_id=_first_str(metadata.get("user_id"), metadata.get("userId")),
         email=_dig(
             data,

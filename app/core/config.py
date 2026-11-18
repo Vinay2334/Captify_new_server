@@ -150,6 +150,17 @@ class Settings(BaseSettings):
         default=5.0, alias="QUOTA_REFRESH_SECONDS"
     )
 
+    # --- Static website access (browser fetches of the JSON API) ---
+    # Origins allowed to call the API from a browser (the static pricing
+    # site fetches the plan catalog and the signed-in user's quota).
+    # Comma-separated; empty disables browser access entirely. Localhost
+    # is on by default because local dev serves the site on :8080 while
+    # the API listens on :8000.
+    website_origins: str = Field(
+        default="http://localhost:8080,http://127.0.0.1:8080",
+        alias="WEBSITE_ORIGINS",
+    )
+
     # --- Dodo Payments billing (webhook upgrades plan/quota) ---
     # Signing secret for the Dodo webhook endpoint (Developer -> Webhooks
     # in the Dodo dashboard; may start with "whsec_"). Empty disables the
@@ -309,6 +320,10 @@ class Settings(BaseSettings):
             if product_id and plan_id:
                 mapping[product_id] = plan_id
         return mapping
+
+    def website_origin_list(self) -> list[str]:
+        """Parsed WEBSITE_ORIGINS for the CORS middleware (empty = locked)."""
+        return [o.strip() for o in self.website_origins.split(",") if o.strip()]
 
     def resolved_jwks_url(self) -> str:
         if self.supabase_jwks_url.strip():

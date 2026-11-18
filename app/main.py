@@ -4,11 +4,13 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.websocket import build_upstream_client, router
 from app.api.webrtc import router as webrtc_router
 from app.api.quota import router as quota_router
 from app.api.billing import router as billing_router
+from app.api.plans import router as plans_router
 from app.core.config import Settings, settings as default_settings
 from app.core.logging import configure_logging, get_logger
 from app.services.quota import build_quota_store
@@ -69,6 +71,20 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     app.include_router(webrtc_router)
     app.include_router(quota_router)
     app.include_router(billing_router)
+    app.include_router(plans_router)
+
+    # Browser access for the static site (pricing page fetches the plan
+    # catalog and the signed-in user's quota). Bearer tokens ride the
+    # Authorization header, so no cookies/credentials are involved.
+    website_origins = resolved.website_origin_list()
+    if website_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=website_origins,
+            allow_methods=["GET", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type"],
+            max_age=600,
+        )
 
     @app.get("/api/v1/health")
     async def health() -> dict:
