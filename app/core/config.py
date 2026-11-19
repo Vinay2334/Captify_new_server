@@ -157,7 +157,7 @@ class Settings(BaseSettings):
     # is on by default because local dev serves the site on :8080 while
     # the API listens on :8000.
     website_origins: str = Field(
-        default="http://localhost:8080,http://127.0.0.1:8080",
+        default="http://localhost:8080,http://127.0.0.1:8080,https://captifylanding.netlify.app/",
         alias="WEBSITE_ORIGINS",
     )
 
