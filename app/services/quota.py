@@ -18,6 +18,16 @@ Safety properties:
 - A running session re-reads remaining quota every few seconds; at zero
   it is cut off with ``quota_exceeded`` so it cannot consume past its
   allocation.
+- Every ``QUOTA_COMMIT_SECONDS`` (default 15) a running session also
+  checkpoints: it commits the seconds billed so far to the DB (session
+  stays ``active``) and then re-reads quota, so another tab/session sees
+  this usage within one interval instead of only at session end. Between
+  checkpoints the session's own uncommitted audio already counts against
+  its effective remainder, so a single session cannot overshoot either.
+  Checkpoints carry the cumulative billed total, so retries apply only
+  the delta since the last checkpoint and never double-bill; a session
+  that ultimately bills 0 (no transcript / upstream failure) refunds any
+  checkpointed seconds at ``finish``.
 """
 
 from __future__ import annotations
@@ -98,6 +108,18 @@ class QuotaStore:
         """Idempotent finalize. Returns the fresh snapshot (None if unknown)."""
         raise NotImplementedError
 
+    async def checkpoint(
+        self, client_session_id: str, billed_seconds: int
+    ) -> QuotaSnapshot | None:
+        """Commit cumulative billed seconds mid-session (stays active).
+
+        ``billed_seconds`` is the session total so far, not a delta: only
+        the increase since the last checkpoint/finalize is applied, so a
+        retried checkpoint never double-bills. Returns the fresh snapshot
+        (None if the session is unknown or already finalized).
+        """
+        raise NotImplementedError
+
 
 class MemoryQuotaStore(QuotaStore):
     """In-process store: local dev fallback and hermetic tests."""
@@ -151,6 +173,24 @@ class MemoryQuotaStore(QuotaStore):
             }
             return snapshot
 
+    async def checkpoint(
+        self, client_session_id: str, billed_seconds: int
+    ) -> QuotaSnapshot | None:
+        async with self._lock:
+            session = self._sessions.get(client_session_id)
+            if session is None or session["status"] in ("completed", "failed"):
+                return None
+            billed = max(int(billed_seconds or 0), 0)
+            delta = max(billed - session["billed"], 0)
+            if delta:
+                session["billed"] = billed
+                profile = self._profiles.setdefault(
+                    session["user_id"],
+                    {"plan": MEMORY_DEFAULT_PLAN, "limit": self._default_limit, "used": 0},
+                )
+                profile["used"] += delta
+            return self._snapshot(session["user_id"])
+
     async def commit(
         self, client_session_id: str, billed_seconds: int, status: str
     ) -> QuotaSnapshot | None:
@@ -160,13 +200,18 @@ class MemoryQuotaStore(QuotaStore):
                 return None
             if session["status"] in ("completed", "failed"):
                 return self._snapshot(session["user_id"])
+            # Delta against checkpointed seconds: a session billed at
+            # checkpoints only pays the remainder here, and one that
+            # ultimately bills 0 refunds what it checkpointed.
+            final_billed = max(int(billed_seconds or 0), 0)
+            delta = final_billed - session["billed"]
             session["status"] = status
-            session["billed"] = max(int(billed_seconds or 0), 0)
+            session["billed"] = final_billed
             profile = self._profiles.setdefault(
                 session["user_id"],
                 {"plan": MEMORY_DEFAULT_PLAN, "limit": self._default_limit, "used": 0},
             )
-            profile["used"] += session["billed"]
+            profile["used"] = max(profile["used"] + delta, 0)
             return self._snapshot(session["user_id"])
 
 
@@ -292,6 +337,31 @@ class SupabaseQuotaStore(QuotaStore):
             log.warning("session insert failed type=%s", type(exc).__name__)
         return snapshot
 
+    async def checkpoint(
+        self, client_session_id: str, billed_seconds: int
+    ) -> QuotaSnapshot | None:
+        data = await self._rpc(
+            "checkpoint_session_usage",
+            {
+                "p_client_session_id": client_session_id,
+                "p_billed_seconds": max(int(billed_seconds or 0), 0),
+            },
+        )
+        # None covers a DB without the checkpoint migration yet: the
+        # tracker keeps the seconds uncommitted and retries next interval
+        # (its effective-remainder check still bounds this session).
+        if data is None:
+            return None
+        used = data.get("used_seconds")
+        if used is None:
+            return None
+        return QuotaSnapshot(
+            user_id="",
+            plan=str(data.get("plan", "Free")),
+            used_seconds=int(used or 0),
+            limit_seconds=int(data.get("limit_seconds", 0) or 0),
+        )
+
     async def commit(
         self, client_session_id: str, billed_seconds: int, status: str
     ) -> QuotaSnapshot | None:
@@ -338,8 +408,11 @@ class SessionQuotaTracker:
     audio_bytes: int = 0
     transcripts_emitted: int = 0
     refresh_interval: float = 5.0
+    checkpoint_interval: float = 15.0
     _finished: bool = field(default=False, init=False)
     _last_refresh: float = field(default_factory=time.monotonic, init=False)
+    _committed_seconds: int = field(default=0, init=False)
+    _last_checkpoint: float = field(default_factory=time.monotonic, init=False)
 
     @property
     def billed_seconds(self) -> int:
@@ -349,6 +422,25 @@ class SessionQuotaTracker:
     def remaining_seconds(self) -> int:
         return self.snapshot.remaining_seconds
 
+    @property
+    def committed_seconds(self) -> int:
+        """Seconds already checkpointed/committed to the DB."""
+        return self._committed_seconds
+
+    @property
+    def uncommitted_seconds(self) -> int:
+        """Billed seconds not yet in the DB snapshot."""
+        return max(self.billed_seconds - self._committed_seconds, 0)
+
+    @property
+    def effective_remaining_seconds(self) -> int:
+        """DB remainder minus this session's uncommitted audio.
+
+        The DB snapshot alone never shrinks while this session runs, so
+        the cutoff must use this value to fire mid-session.
+        """
+        return max(self.snapshot.remaining_seconds - self.uncommitted_seconds, 0)
+
     def add_audio_bytes(self, num_bytes: int) -> None:
         if num_bytes > 0:
             self.audio_bytes += num_bytes
@@ -357,7 +449,62 @@ class SessionQuotaTracker:
         self.transcripts_emitted += 1
 
     def quota_event(self) -> dict:
-        return {"type": "quota.update", **self.snapshot.to_dict()}
+        event = self.snapshot.to_dict()
+        event["used_seconds"] = self.snapshot.used_seconds + self.uncommitted_seconds
+        event["remaining_seconds"] = self.effective_remaining_seconds
+        return {"type": "quota.update", **event}
+
+    async def checkpoint(self) -> QuotaSnapshot:
+        """Commit the billed-so-far total to the DB now (stays active).
+
+        Unconditional: the 15s background worker calls this every tick,
+        even with no new whole second or no transcript yet, so usage
+        reaches the DB on cadence rather than only when convenient. The
+        store applies only the delta since the last checkpoint, so
+        repeat commits never double-bill; if the session later bills 0
+        at finish (no transcript / upstream failure), ``finish`` refunds
+        whatever was committed here.
+        """
+        if self._finished:
+            return self.snapshot
+        self._last_checkpoint = time.monotonic()
+        billed = self.billed_seconds
+        try:
+            fresh = await self.store.checkpoint(self.client_session_id, billed)
+        except Exception as exc:
+            log.warning("quota checkpoint failed type=%s", type(exc).__name__)
+            return self.snapshot
+        if fresh is None:
+            # Unknown session or checkpoint RPC not deployed yet: keep
+            # the seconds uncommitted and retry on the next tick.
+            log.warning("quota checkpoint unavailable for session")
+            return self.snapshot
+        if not fresh.user_id:
+            fresh = QuotaSnapshot(
+                user_id=self.user_id,
+                plan=fresh.plan,
+                used_seconds=fresh.used_seconds,
+                limit_seconds=fresh.limit_seconds,
+            )
+        self.snapshot = fresh
+        self._committed_seconds = billed
+        return self.snapshot
+
+    async def maybe_checkpoint(
+        self, *, force: bool = False, interval: float | None = None
+    ) -> QuotaSnapshot:
+        """Checkpoint if the interval has elapsed (or ``force``).
+
+        Kept for interval-driven callers; the transports instead run a
+        dedicated 15s worker that calls :meth:`checkpoint` directly.
+        """
+        if self._finished:
+            return self.snapshot
+        now = time.monotonic()
+        due = self.checkpoint_interval if interval is None else interval
+        if not force and now - self._last_checkpoint < max(due, 0.0):
+            return self.snapshot
+        return await self.checkpoint()
 
     async def maybe_refresh(self, *, force: bool = False) -> QuotaSnapshot:
         now = time.monotonic()
@@ -394,6 +541,9 @@ class SessionQuotaTracker:
                 used_seconds=final.used_seconds,
                 limit_seconds=final.limit_seconds,
             )
+        if final is not None:
+            self._committed_seconds = billed
+            self.snapshot = final
         log.info(
             "quota session billed user=%s billed=%ds transcripts=%d status=%s reason=%s",
             self.user_id,

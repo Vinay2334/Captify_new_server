@@ -89,7 +89,15 @@ verified Supabase access token and every subtitle session is billed in
 whole seconds against the user's quota (`Remaining = limit - used`).
 Without it the endpoints keep the open local-dev behavior above.
 
+While a session runs, the backend checkpoints its billed-so-far seconds
+to the DB every `QUOTA_COMMIT_SECONDS` (default 15) and then re-reads
+quota, so concurrent sessions see each other's usage within one interval;
+between checkpoints a session's own uncommitted audio already counts
+against its remainder, and it is cut off at zero.
+
 - Schema + RLS + atomic RPCs: `supabase/migrations/0001_auth_quota.sql`
+  (plus `20261119000000_quota_checkpoint.sql` for the checkpoint RPC —
+  apply it with `supabase db push` on existing projects)
 - Setup (Google OAuth, extension config, dashboard plan changes):
   `SUPABASE_SETUP.md`
 - Quota tests: `tests/test_auth_quota.py`

@@ -149,6 +149,13 @@ class Settings(BaseSettings):
     quota_refresh_seconds: float = Field(
         default=5.0, alias="QUOTA_REFRESH_SECONDS"
     )
+    # How often a running session commits its billed-so-far seconds to
+    # the DB (checkpoint, session stays active) before re-reading quota,
+    # so other tabs/sessions see the usage. Bounds cross-session
+    # overshoot to roughly this many seconds per extra session.
+    quota_commit_seconds: float = Field(
+        default=15.0, alias="QUOTA_COMMIT_SECONDS"
+    )
 
     # --- Static website access (browser fetches of the JSON API) ---
     # Origins allowed to call the API from a browser (the static pricing
@@ -234,7 +241,9 @@ class Settings(BaseSettings):
             raise ValueError("must be zero or positive")
         return value
 
-    @field_validator("session_idle_timeout_seconds")
+    @field_validator(
+        "session_idle_timeout_seconds", "quota_refresh_seconds", "quota_commit_seconds"
+    )
     @classmethod
     def _positive_float(cls, value: float) -> float:
         if value <= 0:

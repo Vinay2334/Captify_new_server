@@ -204,6 +204,109 @@ async def test_concurrent_sessions_bill_exactly_once_each():
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_commits_mid_session_and_finish_does_not_double_bill():
+    store = MemoryQuotaStore()
+    tracker = await begin_tracked_session(store, USER_ID, "sess-checkpoint")
+    tracker.add_audio_bytes(96_000)  # 2 s of audio, session still running
+    tracker.note_transcript()
+    snapshot = await tracker.maybe_checkpoint(force=True)
+    # Usage is in the DB while the session is still open.
+    assert snapshot.used_seconds == 2
+    assert (await store.get_quota(USER_ID)).used_seconds == 2
+    # A retried checkpoint for the same audio is a no-op.
+    snapshot = await tracker.maybe_checkpoint(force=True)
+    assert snapshot.used_seconds == 2
+    # Finish bills only the seconds streamed after the checkpoint.
+    tracker.add_audio_bytes(48_000)  # +1 s
+    final = await tracker.finish("closed")
+    assert final is not None
+    assert final.used_seconds == 3
+    assert final.remaining_seconds == 5997
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_makes_usage_visible_to_another_session():
+    # Another tab's session must see this session's committed usage on its
+    # next refresh instead of both overshooting the same remainder.
+    store = MemoryQuotaStore()
+    store.set_plan(USER_ID, "Free", 10)
+    first = await begin_tracked_session(store, USER_ID, "sess-tab-a")
+    second = await begin_tracked_session(store, USER_ID, "sess-tab-b")
+    first.add_audio_bytes(48_000 * 8)  # 8 of the 10 remaining seconds
+    first.note_transcript()
+    await first.maybe_checkpoint(force=True)
+    snapshot = await second.maybe_refresh(force=True)
+    assert snapshot.remaining_seconds == 2
+    assert second.effective_remaining_seconds == 2
+
+
+@pytest.mark.asyncio
+async def test_effective_remaining_counts_uncommitted_audio():
+    # Between checkpoints the DB still shows the old remainder, but this
+    # session's own streamed audio already counts against it.
+    store = MemoryQuotaStore()
+    store.set_plan(USER_ID, "Free", 10)
+    tracker = await begin_tracked_session(store, USER_ID, "sess-live")
+    tracker.add_audio_bytes(48_000 * 10)  # whole remainder, not yet committed
+    tracker.note_transcript()
+    assert tracker.snapshot.remaining_seconds == 10
+    assert tracker.uncommitted_seconds == 10
+    assert tracker.effective_remaining_seconds == 0
+    assert tracker.quota_event()["remaining_seconds"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_session_refunds_checkpointed_seconds():
+    store = MemoryQuotaStore()
+    tracker = await begin_tracked_session(store, USER_ID, "sess-fail-ckpt")
+    tracker.add_audio_bytes(96_000)
+    tracker.note_transcript()
+    await tracker.maybe_checkpoint(force=True)
+    assert (await store.get_quota(USER_ID)).used_seconds == 2
+    final = await tracker.finish("upstream_error:rate_limited")
+    assert final is not None
+    assert final.used_seconds == 0
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_commits_before_first_transcript_and_silent_finish_refunds():
+    # The 15s worker commits on cadence, even before any transcript. A
+    # session that ends with no output still bills 0 overall, so finish
+    # refunds what the checkpoint committed.
+    store = MemoryQuotaStore()
+    tracker = await begin_tracked_session(store, USER_ID, "sess-silent-ckpt")
+    tracker.add_audio_bytes(96_000)
+    await tracker.checkpoint()
+    assert (await store.get_quota(USER_ID)).used_seconds == 2
+    final = await tracker.finish("closed")
+    assert final is not None
+    assert final.used_seconds == 0
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_commits_to_db_on_every_call():
+    # The background worker commits every 15s tick: each call reaches the
+    # store even when no new whole second has been billed since the last.
+    class CountingStore(MemoryQuotaStore):
+        def __init__(self):
+            super().__init__()
+            self.checkpoint_calls = 0
+
+        async def checkpoint(self, client_session_id, billed_seconds):
+            self.checkpoint_calls += 1
+            return await super().checkpoint(client_session_id, billed_seconds)
+
+    store = CountingStore()
+    tracker = await begin_tracked_session(store, USER_ID, "sess-worker")
+    await tracker.checkpoint()
+    await tracker.checkpoint()
+    await tracker.checkpoint()
+    assert store.checkpoint_calls == 3
+    # No audio was billed, so repeated commits change nothing in the DB.
+    assert (await store.get_quota(USER_ID)).used_seconds == 0
+
+
+@pytest.mark.asyncio
 async def test_exhausted_quota_refuses_new_session():
     store = MemoryQuotaStore()
     store.set_plan(USER_ID, "Free", 0)

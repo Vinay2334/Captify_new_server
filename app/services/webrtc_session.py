@@ -217,18 +217,46 @@ class WebRTCRelaySession:
 
     # --- quota (only when the endpoint authorized a tracked session) ---
 
-    async def _quota_watch(self) -> str:
-        """Cut the session off once remaining quota hits zero."""
+    async def _quota_checkpoint_loop(self) -> str:
+        """Background worker: commit quota to the DB every 15s.
+
+        Each tick commits this session's billed-so-far seconds to the DB
+        (QUOTA_COMMIT_SECONDS, default 15), then fetches the fresh quota
+        — picking up other tabs' commits and plan changes — and cuts the
+        session off if it has overshot. Runs on its own cadence,
+        independent of the refresh/watch tick below.
+        """
         assert self._quota is not None
-        interval = max(self._settings.quota_refresh_seconds, 1.0)
+        interval = max(
+            getattr(self._settings, "quota_commit_seconds", 15.0), 1.0
+        )
         while True:
             await asyncio.sleep(interval)
-            snapshot = await self._quota.maybe_refresh(force=True)
+            await self._quota.checkpoint()
+            await self._quota.maybe_refresh(force=True)
             try:
                 self._channel.send(json.dumps(self._quota.quota_event()))
             except Exception:
                 return "channel_closed"
-            if snapshot.remaining_seconds <= 0:
+            if self._quota.effective_remaining_seconds <= 0:
+                self._send_channel_error(
+                    "quota_exceeded",
+                    "Subtitle quota exhausted. Upgrade your plan to continue.",
+                )
+                return "quota_exceeded"
+
+    async def _quota_watch(self) -> str:
+        """Cut the session off once effective remaining quota hits zero."""
+        assert self._quota is not None
+        interval = max(self._settings.quota_refresh_seconds, 1.0)
+        while True:
+            await asyncio.sleep(interval)
+            await self._quota.maybe_refresh(force=True)
+            try:
+                self._channel.send(json.dumps(self._quota.quota_event()))
+            except Exception:
+                return "channel_closed"
+            if self._quota.effective_remaining_seconds <= 0:
                 self._send_channel_error(
                     "quota_exceeded",
                     "Subtitle quota exhausted. Upgrade your plan to continue.",
@@ -282,7 +310,10 @@ class WebRTCRelaySession:
             watch = asyncio.create_task(
                 self._quota_watch(), name="webrtc-quota-watch"
             )
-            tasks = {c2u, u2c, watch}
+            commit = asyncio.create_task(
+                self._quota_checkpoint_loop(), name="webrtc-quota-commit"
+            )
+            tasks = {c2u, u2c, watch, commit}
         try:
             done, _ = await asyncio.wait(
                 tasks, return_when=asyncio.FIRST_COMPLETED
