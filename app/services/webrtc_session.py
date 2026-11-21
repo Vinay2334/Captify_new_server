@@ -41,6 +41,7 @@ from app.schemas.events import (
     UpstreamError,
     map_upstream_event,
     is_same_language,
+    normalize_model_tier,
     parse_client_event,
 )
 from app.services.stt_factory import STTWorkflowFactory
@@ -116,12 +117,21 @@ class WebRTCRelaySession:
         on_message: Callable[[bytes | str], None] | None = None,
         subtitle: Any | None = None,
         quota: SessionQuotaTracker | None = None,
+        model_tier: str | None = None,
+        upstream_factory: Any | None = None,
     ) -> None:
         self._channel = channel
         self._upstream = upstream
         self._settings = settings
         self._quota = quota
-        self._workflow = STTWorkflowFactory.get_workflow(settings)
+        # Factory for on-the-fly engine swaps (tier) -> upstream client.
+        # Direct-constructed sessions (tests) may omit it; a tier flip
+        # then ends the session instead of swapping.
+        self._upstream_factory = upstream_factory
+        self._upstream_gen = 0
+        self._model_tier = normalize_model_tier(model_tier)
+        self._workflow = STTWorkflowFactory.get_workflow(settings, self._model_tier)
+        self._is_tiered = self._workflow.tier is not None
         self._subtitle = subtitle or SubtitleFactory.get_translator(settings)
         self._subtitle_target_language = settings.translation_target_language
         self._subtitle_source = settings.translation_source_language or None
@@ -132,15 +142,20 @@ class WebRTCRelaySession:
         self._audio_chunks = 0
         self._audio_bytes = 0
         self._upstream_events = 0
-        # Session mode: the deployment-wide transcribe switch, or a
-        # same-language session (the translation model omits same-language
-        # audio). Drives append/commit event names, session updates, and
-        # upstream transcript mapping below.
-        self._transcription_mode = settings.transcribe_mode or is_same_language(
-            settings.translation_source_language,
-            settings.translation_target_language,
-        )
-        self._transcription_languages = settings.transcription_language_hint()
+        # Session mode: tiered sessions always transcribe (source-language
+        # captions; translation happens later as text-to-text). Legacy
+        # sessions keep the old behavior: the deployment-wide transcribe
+        # switch, or a same-language session (the translation model omits
+        # same-language audio).
+        if self._is_tiered:
+            self._transcription_mode = True
+            self._transcription_languages: list[str] = []
+        else:
+            self._transcription_mode = settings.transcribe_mode or is_same_language(
+                settings.translation_source_language,
+                settings.translation_target_language,
+            )
+            self._transcription_languages = settings.transcription_language_hint()
         # Mode explicitly requested by the extension for this session
         # ("translation" / "transcription"); None until it asks. An
         # explicit transcription request disables subtitle translation
@@ -288,7 +303,7 @@ class WebRTCRelaySession:
         try:
             self._channel.send(
                 SessionReadyEvent(
-                    model=self._settings.active_model()
+                    model=self._settings.active_model_for_tier(self._model_tier)
                 ).model_dump_json()
             )
         except Exception:
@@ -364,6 +379,16 @@ class WebRTCRelaySession:
         self, event: LanguageConfigEvent
     ) -> str | None:
         """Apply a mode/language change upstream. Returns stop reason."""
+        if event.model_tier is not None:
+            # The tier names the transcription engine per request: when it
+            # changes, swap the upstream engine on the fly. The transport
+            # stays up; audio queued behind this message flows to the new
+            # engine in order.
+            requested_tier = normalize_model_tier(event.model_tier)
+            if requested_tier is not None and requested_tier != self._model_tier:
+                stop = await self._swap_transcription_tier(requested_tier)
+                if stop is not None:
+                    return stop
         mode = event.effective_mode
         if event.mode is None and self._settings.transcribe_mode:
             # Legacy clients without a mode keep the deployment switch.
@@ -386,10 +411,11 @@ class WebRTCRelaySession:
             if event.mode is not None
             else (event.source_lang or self._subtitle_source)
         )
-        if self._settings.transcribe_mode and getattr(
-            self._subtitle, "enabled", False
+        if self._is_tiered or (
+            self._settings.transcribe_mode
+            and getattr(self._subtitle, "enabled", False)
         ):
-            # This deployment transcribes upstream and translates the
+            # Tiered sessions always transcribe upstream and translate the
             # subtitle text instead: keep transcribing (auto-detected
             # source) and let _maybe_translate_subtitle render target.
             return await self._apply_transcription_config(None)
@@ -413,6 +439,85 @@ class WebRTCRelaySession:
         log.info(
             "webrtc translation target language updated target=%s",
             target,
+        )
+        return None
+
+    async def _swap_transcription_tier(self, tier: str) -> str | None:
+        """Swap the upstream transcription engine without dropping transport.
+
+        Connects the new tier's engine first, then flips the relay over:
+        audio already queued behind the triggering message flows to the
+        new engine in order, and the reader task picks it up via the
+        generation guard in ``_upstream_to_channel``. Returns a stop
+        reason when the swap cannot complete (the session then ends and
+        the client's reconnect machinery heals it with a fresh offer).
+        """
+        if not self._settings.upstream_api_key_for_tier(tier):
+            log.warning("webrtc tier switch rejected: tier API key is not set")
+            self._send_channel_error(
+                "not_configured", "translation service is not configured"
+            )
+            return "not_configured"
+        factory = self._upstream_factory
+        if factory is None:
+            self._send_channel_error(
+                "model_tier_mismatch",
+                "Model tier changed mid-session. Reconnect to switch tiers.",
+            )
+            return "model_tier_mismatch"
+        try:
+            new_upstream = factory(tier)
+        except TypeError:
+            # Legacy zero-arg test fakes cannot build a tiered upstream.
+            self._send_channel_error(
+                "model_tier_mismatch",
+                "Model tier changed mid-session. Reconnect to switch tiers.",
+            )
+            return "model_tier_mismatch"
+        connect = getattr(new_upstream, "connect", None)
+        if connect is not None:
+            try:
+                await connect()
+            except UpstreamError as exc:
+                log.warning(
+                    "webrtc tier switch upstream connect failed code=%s",
+                    exc.code,
+                )
+                self._send_channel_error(exc.code, exc.message)
+                return f"upstream_error:{exc.code}"
+            except Exception as exc:
+                log.warning(
+                    "webrtc tier switch upstream connect failed type=%s",
+                    type(exc).__name__,
+                )
+                self._send_channel_error(
+                    "upstream_error", "translation service unavailable"
+                )
+                return "upstream_send_failed"
+        old_upstream = self._upstream
+        self._upstream = new_upstream
+        self._upstream_gen += 1
+        self._workflow = STTWorkflowFactory.get_workflow(self._settings, tier)
+        self._model_tier = normalize_model_tier(tier)
+        self._is_tiered = True
+        self._transcription_mode = True
+        self._transcription_languages = []
+        try:
+            await old_upstream.close()
+        except Exception:
+            pass
+        try:
+            self._channel.send(
+                SessionReadyEvent(
+                    model=self._settings.active_model_for_tier(tier)
+                ).model_dump_json()
+            )
+        except Exception:
+            return "channel_closed"
+        log.info(
+            "webrtc transcription tier switched tier=%s model=%s",
+            tier,
+            self._settings.active_model_for_tier(tier),
         )
         return None
 
@@ -528,7 +633,7 @@ class WebRTCRelaySession:
         return None
 
     def _apply_soniox_language_config(self, event: LanguageConfigEvent) -> str | None:
-        """Track target switches for Soniox (target is fixed at connect)."""
+        """Legacy Soniox target tracking (untiered sessions only)."""
         if event.effective_mode == "transcription":
             self._transcription_mode = True
             self._transcription_languages = (
@@ -736,9 +841,16 @@ class WebRTCRelaySession:
 
     async def _upstream_to_channel(self) -> str:
         while True:
+            upstream = self._upstream
+            gen = self._upstream_gen
             try:
-                raw = await self._upstream.recv_text()
+                raw = await upstream.recv_text()
             except Exception:
+                if gen != self._upstream_gen:
+                    # The engine was hot-swapped underneath this receive
+                    # (the old socket's close surfaced here): keep reading
+                    # from the new engine instead of ending the session.
+                    continue
                 return "upstream_disconnected"
             try:
                 event = json.loads(raw)

@@ -66,7 +66,9 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     app.state.webrtc_peers = set()
     app.state.background_tasks = set()
     app.state.quota_store = build_quota_store(resolved)
-    app.state.upstream_factory = lambda: build_upstream_client(resolved)
+    app.state.upstream_factory = lambda model_tier=None: build_upstream_client(
+        resolved, model_tier
+    )
     app.include_router(router)
     app.include_router(webrtc_router)
     app.include_router(quota_router)

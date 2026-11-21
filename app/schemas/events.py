@@ -23,6 +23,22 @@ from pydantic import BaseModel, Field, model_validator
 # Session modes the extension can request per session.
 SessionMode = Literal["translation", "transcription"]
 
+# Transcription model tiers the extension can request per session.
+# "base" transcribes with Soniox; "pro" transcribes with OpenAI
+# gpt-live-transcribe. The tier picks the transcription (speech-to-text)
+# engine only; translation stays a separate text-to-text step.
+ModelTier = Literal["base", "pro"]
+
+MODEL_TIERS = ("base", "pro")
+
+
+def normalize_model_tier(value: str | None) -> str | None:
+    """Normalize a requested tier, or None when unset/invalid."""
+    if not isinstance(value, str):
+        return None
+    tier = value.strip().lower()
+    return tier if tier in MODEL_TIERS else None
+
 
 # --- client -> backend ---
 
@@ -68,6 +84,12 @@ class LanguageConfigEvent(BaseModel):
 
     type: Literal["language-config"]
     mode: SessionMode | None = None
+    # Transcription tier for this session ("base" Soniox / "pro"
+    # gpt-live-transcribe). Optional for older clients; the relay opens
+    # the named engine at connect time and hot-swaps to it on the fly
+    # whenever a later message names a different tier. The transport
+    # never drops for a tier change.
+    model_tier: ModelTier | None = None
     # Deprecated: accepted from older builds only; never used to pick a
     # source language (the upstream model auto-detects it).
     source_lang: str | None = None

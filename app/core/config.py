@@ -381,5 +381,27 @@ class Settings(BaseSettings):
             return self.openai_transcription_model
         return self.openai_realtime_model
 
+    def default_model_tier(self) -> str:
+        """Tier used when a client does not pick one (legacy mapping)."""
+        return "base" if self.is_soniox_provider() else "pro"
+
+    def active_model_for_tier(self, model_tier: str | None) -> str:
+        """Transcription model for a tier (base=Soniox, pro=OpenAI)."""
+        tier = (model_tier or "").strip().lower()
+        if tier == "base":
+            return self.soniox_model
+        if tier == "pro":
+            return self.openai_transcription_model
+        return self.active_model()
+
+    def upstream_api_key_for_tier(self, model_tier: str | None) -> str:
+        """API key for a tier's transcription provider."""
+        tier = (model_tier or "").strip().lower()
+        if tier == "base":
+            return self.soniox_api_key
+        if tier == "pro":
+            return self.openai_api_key
+        return self.upstream_api_key()
+
 
 settings = Settings()

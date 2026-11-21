@@ -45,6 +45,12 @@ class OfferRequest(BaseModel):
     # extension and reused across reconnects/retries so a retry never
     # bills twice. Server-generated when an older client omits it.
     client_session_id: str | None = Field(default=None, max_length=128)
+    # Transcription tier ("base" Soniox / "pro" gpt-live-transcribe).
+    # Picks the initial speech-to-text engine; omitted keeps the legacy
+    # global STT_PROVIDER behavior. Later tier flips arrive per request
+    # (language-config) and swap the engine on the fly; the transport
+    # never drops for a tier change.
+    model_tier: str | None = None
     # Access-token fallback for clients that cannot set headers; the
     # Authorization header is preferred (see extract_bearer).
     token: str | None = None
@@ -116,12 +122,16 @@ async def webrtc_offer(payload: OfferRequest, request: Request):
             log.warning("webrtc offer rejected: auth failed code=%s", exc.code)
             return _error(401, exc.code, exc.message)
 
+    from app.schemas.events import normalize_model_tier
+
+    model_tier = normalize_model_tier(payload.model_tier)
+
     origin = request.headers.get("origin")
     if not settings.is_origin_allowed(origin):
         log.warning("webrtc offer rejected: disallowed origin")
         return _error(403, "origin_not_allowed", "origin not allowed")
 
-    if not settings.upstream_api_key():
+    if not settings.upstream_api_key_for_tier(model_tier):
         log.warning("webrtc offer rejected: translation API key is not set")
         return _error(
             503, "not_configured", "translation service is not configured"
@@ -190,8 +200,13 @@ async def webrtc_offer(payload: OfferRequest, request: Request):
 
         # Connect upstream BEFORE answering so auth/outage failures surface
         # as HTTP errors, mirroring the WebSocket endpoint (which connects
-        # before sending session.ready).
-        upstream = request.app.state.upstream_factory()
+        # before sending session.ready). The tier picks the transcription
+        # engine (base Soniox / pro gpt-live-transcribe); translation
+        # stays a separate text-to-text step in the relay session.
+        try:
+            upstream = request.app.state.upstream_factory(model_tier)
+        except TypeError:
+            upstream = request.app.state.upstream_factory()
         if not isinstance(upstream, OpenAIRealtimeClient):
             # Tests inject fakes through upstream_factory; accept anything
             # with the connect/close interface.
@@ -254,7 +269,13 @@ async def webrtc_offer(payload: OfferRequest, request: Request):
         local = pc.localDescription
         task = asyncio.create_task(
             _serve_webrtc_session(
-                pc, upstream, channel_holder, settings, state, quota=quota
+                pc,
+                upstream,
+                channel_holder,
+                settings,
+                state,
+                quota=quota,
+                model_tier=model_tier,
             ),
             name="webrtc-session",
         )
@@ -290,7 +311,7 @@ async def webrtc_offer(payload: OfferRequest, request: Request):
 
 
 async def _serve_webrtc_session(
-    pc, upstream, channel_holder, settings, state, quota=None
+    pc, upstream, channel_holder, settings, state, quota=None, model_tier=None
 ) -> None:
     """Own one answered session until the channel or upstream ends."""
     reason = "not_started"
@@ -304,7 +325,14 @@ async def _serve_webrtc_session(
             reason = "channel_never_opened"
             log.warning("webrtc session ended: datachannel never opened")
             return
-        session = WebRTCRelaySession(channel, upstream, settings, quota=quota)
+        session = WebRTCRelaySession(
+            channel,
+            upstream,
+            settings,
+            quota=quota,
+            model_tier=model_tier,
+            upstream_factory=getattr(state, "upstream_factory", None),
+        )
 
         @channel.on("message")
         def _on_message(message) -> None:

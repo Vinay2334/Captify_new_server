@@ -47,9 +47,13 @@ async def _reject(websocket: WebSocket, code: str, message: str, close_code: int
         pass
 
 
-def build_upstream_client(settings: Settings) -> Any:
-    """Build the upstream client for the configured ``STT_PROVIDER``."""
-    return STTWorkflowFactory.create_upstream_client(settings)
+def build_upstream_client(settings: Settings, model_tier: str | None = None) -> Any:
+    """Build the upstream client for a tier (or the legacy provider)."""
+    from app.schemas.events import normalize_model_tier
+
+    return STTWorkflowFactory.create_upstream_client(
+        settings, normalize_model_tier(model_tier)
+    )
 
 
 @router.websocket("/api/v1/transcription/ws")
@@ -138,15 +142,44 @@ async def transcription_ws(websocket: WebSocket) -> None:
             return
         log.info("websocket session authorized user=%s", user.id)
 
+    from app.schemas.events import normalize_model_tier
+
+    model_tier = normalize_model_tier(websocket.query_params.get("model_tier"))
+    if not settings.upstream_api_key_for_tier(model_tier):
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "code": "not_configured",
+                        "message": "translation service is not configured",
+                    }
+                )
+            )
+            await websocket.close(code=1011, reason="service not configured")
+        except Exception:
+            pass
+        log.warning("rejected connection: tier API key is not set")
+        if quota is not None:
+            try:
+                await quota.finish("not_configured")
+            except Exception:
+                pass
+        return
     try:
-        await _handle_session(websocket, settings, quota=quota)
+        await _handle_session(
+            websocket, settings, quota=quota, model_tier=model_tier
+        )
     finally:
         async with state.slot_lock:
             state.active_sessions = max(0, state.active_sessions - 1)
 
 
 async def _handle_session(
-    websocket: WebSocket, settings: Settings, quota: SessionQuotaTracker | None = None
+    websocket: WebSocket,
+    settings: Settings,
+    quota: SessionQuotaTracker | None = None,
+    model_tier: str | None = None,
 ) -> None:
     async def _abort(reason: str) -> None:
         # Sessions that never reached the relay still finalize (0 billed,
@@ -157,7 +190,7 @@ async def _handle_session(
             except Exception:
                 pass
 
-    if not settings.upstream_api_key():
+    if not settings.upstream_api_key_for_tier(model_tier):
         try:
             await websocket.send_text(
                 json.dumps(
@@ -176,7 +209,11 @@ async def _handle_session(
         return
 
     factory = websocket.app.state.upstream_factory
-    upstream = factory()
+    try:
+        upstream = factory(model_tier)
+    except TypeError:
+        # Tests inject fakes with a zero-arg factory.
+        upstream = factory()
     try:
         await upstream.connect()
     except Exception as exc:
@@ -199,7 +236,7 @@ async def _handle_session(
 
     try:
         await websocket.send_text(
-            SessionReadyEvent(model=settings.active_model())
+            SessionReadyEvent(model=settings.active_model_for_tier(model_tier))
             .model_dump_json()
         )
     except Exception:
@@ -207,7 +244,14 @@ async def _handle_session(
         await _abort("client_disconnected")
         return
 
-    relay = RelaySession(client=websocket, upstream=upstream, settings=settings, quota=quota)
+    relay = RelaySession(
+        client=websocket,
+        upstream=upstream,
+        settings=settings,
+        quota=quota,
+        model_tier=model_tier,
+        upstream_factory=websocket.app.state.upstream_factory,
+    )
     try:
         reason = await relay.run()
     except asyncio.CancelledError:

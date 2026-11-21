@@ -19,19 +19,38 @@ Two client transports are supported; both feed the same upstream session.
   continuously with no commits, matching the upstream translation
   session, which has no commit / turn lifecycle.
 
-## Translation behavior
+## Transcription tiers and translation behavior
 
-- Session mode is picked per session in the extension's Mode dropdown
-  (`translation` / `transcription`). Source language is always
-  auto-detected by the model (the extension no longer sends one); the
-  target language defaults to
-  `OPENAI_TRANSLATION_TARGET_LANGUAGE` (`en`). The extension can switch
-  it per session by sending
+- The extension's Model dropdown picks the transcription (speech-to-text)
+  engine per session: `base` transcribes with Soniox `stt-rt-v5`
+  (`SONIOX_MODEL`), `pro` transcribes with `gpt-live-transcribe`
+  (`OPENAI_TRANSCRIPTION_MODEL`). The tier travels in the WebRTC offer
+  (`model_tier`) and in every `language-config` (`model_tier`); when a
+  request names a different tier, the backend connects the new engine
+  and swaps it in on the fly — the transport never drops and the client
+  never re-offers. A fresh `session.ready` announces the new model.
+  Sessions without a tier keep the legacy `STT_PROVIDER` behavior. Unit
+  economics per tier are unsettled on purpose: the tier only selects
+  the engine, never pricing.
+- Every tiered session transcribes: both engines emit verbatim
+  source-language `transcript.delta` / `transcript.completed` events in
+  the same downstream shape, so transcription output is identical
+  whichever tier produced it.
+- Translation is a separate text-to-text step over those transcripts,
+  decoupled from transcription: changing the transcription tier never
+  changes translation, and changing the subtitle provider never changes
+  transcription. Session mode is still picked per session in the
+  extension's Mode dropdown (`translation` / `transcription`). Source
+  language is always auto-detected (the extension no longer sends one);
+  the target language defaults to `OPENAI_TRANSLATION_TARGET_LANGUAGE`
+  (`en`). The extension can switch it per session by sending
   `{"type": "language-config", "mode": "translation", "target_lang": "es"}`
   (transcription sends just `{"type": "language-config", "mode": "transcription"}`,
   no target, and captions stay in the auto-detected source language):
-  `target_lang` is forwarded upstream as a `session.update` (repeats for
-  the same language are skipped).
+  `target_lang` sets the subtitle translation target (repeats for the
+  same language are skipped). Tiered sessions never send `target_lang`
+  upstream: they keep transcribing and let the subtitle step render the
+  target text.
 - Transcribe mode: set `TRANSCRIBE_MODE=true` to transcribe every session
   with `gpt-realtime-transcribe` (`OPENAI_TRANSCRIPTION_MODEL`) instead of
   translating. Commits close each turn and transcription events map to the
@@ -48,9 +67,11 @@ Two client transports are supported; both feed the same upstream session.
   `OPENAI_TRANSLATION_SOURCE_LANGUAGE` to match the target when a
   deployment is same-language from the start, so the upstream socket
   opens on the transcription endpoint.
-- The backend forwards translated transcript deltas
-  (`session.output_transcript.delta` → `transcript.delta`). Translation
-  emits deltas only, so `transcript.completed` never fires.
+- Legacy (untiered) OpenAI translation sessions still forward translated
+  transcript deltas (`session.output_transcript.delta` → `transcript.delta`).
+  Translation emits deltas only, so `transcript.completed` never fires.
+  Soniox never translates: its one-way translation workflow was removed,
+  and Soniox sessions are transcription-only (verbatim source text).
 - Subtitle translation: set `SUBTITLE_PROVIDER=deepseek` (plus
   `DEEPSEEK_API_KEY`) to translate `openai-live-transcribe` transcripts
   into the session target language with the `deepseek-flash` chat model

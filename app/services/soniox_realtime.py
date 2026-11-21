@@ -1,30 +1,37 @@
-"""Upstream Soniox Realtime WebSocket client (stt-rt-v5).
+"""Upstream Soniox Realtime WebSocket client (stt-rt-v5, transcription).
 
 One instance per connected extension client. Opens
 ``wss://stt-rt.soniox.com/transcribe-websocket`` (configurable),
 authenticates with the server-side API key via the ``Authorization``
-header, and configures a session with a JSON first frame such as::
+header, and configures a transcription session with a JSON first frame
+such as::
 
     {
         "model": "stt-rt-v5",
         "audio_format": "pcm_s16le",
         "sample_rate": 24000,
         "num_channels": 1,
-        "language_hints": ["en"],
-        "translation": {"type": "one_way", "target_language": "es"},
+        "language_hints": ["en"]
     }
+
+Transcription only: no Soniox ``translation`` block is ever sent.
+Soniox used to translate audio directly; that coupled speech-to-text
+to translation, so it was removed. This client now emits verbatim
+source-language tokens, and translation (when the session asks for it)
+is a separate text-to-text step over those transcripts
+(``app.services.subtitle_factory``), identical for every tier.
 
 Wire contract (Soniox Speech-to-Text WebSocket API docs, 2026):
 
 - C->S first frame: JSON session config (``model``, ``audio_format``,
-  ``language_hints``, optional ``translation`` block, endpoint options).
+  ``language_hints``, endpoint options; never a ``translation`` block).
 - C->S audio: binary WebSocket frames, or text frames holding standard
   base64-encoded bytes. This client sends audio as base64 text frames so
   the relay keeps its text-only upstream socket interface.
 - S->C: JSON responses ``{"tokens": [...], "finished": false}`` where
   each token carries ``text``, ``is_final``, ``translation_status``
-  (``"original"`` / ``"translation"`` / ``"none"``), ``language`` and,
-  for spoken tokens, timestamps. Final tokens are returned exactly
+  (``"original"`` / ``"none"`` without a translation block), ``language``
+  and, for spoken tokens, timestamps. Final tokens are returned exactly
   once; non-final tokens are provisional snapshots.
 - C->S end of stream: an empty text frame. The server then sends a
   ``{"tokens": [], "finished": true}`` response and closes.
@@ -47,32 +54,6 @@ log = get_logger(__name__)
 
 SONIOX_DEFAULT_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 SONIOX_DEFAULT_MODEL = "stt-rt-v5"
-
-
-def build_soniox_config(
-    target_language: str,
-    model: str = SONIOX_DEFAULT_MODEL,
-    language_hints: list[str] | None = None,
-    sample_rate: int = 24000,
-    num_channels: int = 1,
-    enable_endpoint_detection: bool = True,
-) -> str:
-    """Session config for one-way translation into ``target_language``."""
-    return json.dumps(
-        {
-            "model": model,
-            "audio_format": "pcm_s16le",
-            "sample_rate": sample_rate,
-            "num_channels": num_channels,
-            "language_hints": list(language_hints) if language_hints else [target_language],
-            "enable_language_identification": True,
-            "enable_endpoint_detection": enable_endpoint_detection,
-            "translation": {
-                "type": "one_way",
-                "target_language": target_language,
-            },
-        }
-    )
 
 
 def build_soniox_transcribe_config(
@@ -111,14 +92,6 @@ def to_soniox_audio_frame(audio_b64: str) -> str:
     return audio_b64
 
 
-def _translated_text(tokens: list[dict]) -> str:
-    return "".join(
-        token.get("text", "")
-        for token in tokens
-        if token.get("is_final") and token.get("translation_status") == "translation"
-    )
-
-
 def _original_text(tokens: list[dict]) -> str:
     return "".join(
         token.get("text", "")
@@ -133,12 +106,14 @@ def map_soniox_event(
 ) -> TranscriptDeltaEvent | None:
     """Map one Soniox token response to an extension transcript delta.
 
-    Only finalized tokens map downstream, so each spoken word is
-    emitted exactly once: provisional (non-final) tokens are skipped
-    here and surface once finalized. Translation sessions emit the
-    translated tokens; transcription sessions emit the original ones.
-    The ``finished`` response and empty token lists map to None, which
-    matches the translation path (deltas only, no completed turns).
+    Only finalized original tokens map downstream, so each spoken word
+    is emitted exactly once: provisional (non-final) tokens are skipped
+    here and surface once finalized. Soniox is transcription-only now,
+    so ``transcription_mode`` is accepted for call compatibility and
+    ignored: translated tokens (from a legacy translation session) are
+    never emitted. The ``finished`` response and empty token lists map
+    to None (deltas only, no completed turns), the same downstream
+    shape the OpenAI transcription tier produces.
     """
     if event.get("type") == "error":
         raise UpstreamError.from_event(event)
@@ -154,7 +129,8 @@ def map_soniox_event(
     tokens = event.get("tokens", [])
     if not isinstance(tokens, list) or not tokens:
         return None
-    text = _original_text(tokens) if transcription_mode else _translated_text(tokens)
+    del transcription_mode  # Transcription-only: always original tokens.
+    text = _original_text(tokens)
     if not text:
         return None
     return TranscriptDeltaEvent(delta=text, item_id="")
@@ -192,7 +168,10 @@ class SonioxRealtimeClient:
         self._num_channels = num_channels
         self._enable_endpoint_detection = enable_endpoint_detection
         self._connect_timeout = connect_timeout
-        self._is_transcription = is_transcription
+        # Transcription-only (see module docstring): the legacy flag is
+        # accepted for call compatibility but no longer selects a mode.
+        del is_transcription
+        self._is_transcription = True
         self._ws: Any = None
 
     @property
@@ -208,16 +187,7 @@ class SonioxRealtimeClient:
         return self._is_transcription
 
     def _config_for_mode(self) -> str:
-        if self._is_transcription:
-            return build_soniox_transcribe_config(
-                self._target_language,
-                model=self._model,
-                language_hints=self._language_hints,
-                sample_rate=self._sample_rate,
-                num_channels=self._num_channels,
-                enable_endpoint_detection=self._enable_endpoint_detection,
-            )
-        return build_soniox_config(
+        return build_soniox_transcribe_config(
             self._target_language,
             model=self._model,
             language_hints=self._language_hints,

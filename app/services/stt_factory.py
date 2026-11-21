@@ -1,21 +1,24 @@
-"""STT provider factory: drops in the correct model workflow per settings.
+"""STT provider factory: drops in the correct transcription workflow.
 
-The global ``STT_PROVIDER`` setting (``"openai"`` or ``"soniox"``) picks
-which upstream workflow a session uses. Each workflow bundles everything
-that differs between providers behind one interface:
+Transcription (speech-to-text) and translation (text-to-text) are
+decoupled:
 
-- upstream client construction (OpenAI Realtime vs Soniox ``stt-rt-v5``),
-- client-audio -> upstream payload mapping (both transports),
-- upstream-event -> extension-event mapping,
-- runtime language-update payloads (``None`` means the switch needs no
-  upstream send; the relay then only flips its local mode).
+- This factory picks only the transcription engine. ``base`` uses
+  Soniox ``stt-rt-v5`` transcription; ``pro`` uses OpenAI
+  ``gpt-live-transcribe`` (``OPENAI_TRANSCRIPTION_MODEL``). Both emit
+  verbatim source-language ``transcript.delta`` / ``transcript.completed``
+  events, so the downstream extension protocol is identical either way.
+- Translation is a separate text-to-text step over those transcripts
+  (``app.services.subtitle_factory``), applied by the relay sessions
+  only when the session mode is ``translation``. Changing the tier never
+  changes the translation step, and changing the translation provider
+  never changes transcription.
 
-``RelaySession`` and ``WebRTCRelaySession`` resolve their workflow once
-via ``STTWorkflowFactory.get_workflow(settings)`` and delegate all
-provider-specific mapping to it, so adding a third provider only means
-adding a workflow class plus a branch here. The pre-existing
-module-level ``to_upstream_payload`` / ``map_upstream_event`` helpers
-stay OpenAI-shaped for backward compatibility.
+Per-session tier selection: sessions that carry an explicit
+``model_tier`` (extension dropdown, WebRTC offer, or ``?model_tier=``)
+resolve their workflow here with that tier. Sessions without one keep
+the legacy global ``STT_PROVIDER`` behavior so older clients and tests
+are unchanged.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from app.schemas.events import (
     UpstreamAudioCommitEvent,
     UpstreamError,
     map_upstream_event as map_openai_event,
+    normalize_model_tier,
 )
 from app.services.openai_realtime import (
     OpenAIRealtimeClient,
@@ -45,11 +49,22 @@ from app.services.soniox_realtime import (
 PROVIDER_OPENAI = "openai"
 PROVIDER_SONIOX = "soniox"
 
+MODEL_TIER_BASE = "base"
+MODEL_TIER_PRO = "pro"
+
 
 class OpenAIWorkflow:
-    """Workflow for the OpenAI Realtime translation/transcription models."""
+    """Legacy OpenAI workflow (global STT_PROVIDER=openai, no tier).
+
+    Preserves the pre-tier behavior: translation sessions open on
+    ``gpt-realtime-translate`` unless the deployment transcribe switch
+    or a same-language config starts the session in transcription.
+    Tiered (``pro``) sessions use :class:`OpenAITranscriptionWorkflow`
+    instead, which is transcription-only.
+    """
 
     name = PROVIDER_OPENAI
+    tier = None
 
     def create_upstream_client(self, settings: Any) -> OpenAIRealtimeClient:
         if settings.starts_in_transcription():
@@ -77,8 +92,6 @@ class OpenAIWorkflow:
     def to_upstream_payload(
         self, event: Any, transcription_mode: bool = False
     ) -> str | None:
-        # Single source of truth lives in relay.py; imported lazily to
-        # avoid a module cycle (relay delegates to this workflow).
         from app.services.relay import to_upstream_payload
 
         return to_upstream_payload(event, transcription_mode)
@@ -92,7 +105,7 @@ class OpenAIWorkflow:
 
     def map_upstream_event(
         self, event: dict[str, Any], transcription_mode: bool = False
-    ):  # -> BaseModel | None
+    ):
         return map_openai_event(event, transcription_mode)
 
     def build_language_update(
@@ -108,16 +121,41 @@ class OpenAIWorkflow:
         return build_transcription_session_update(model, languages)
 
 
-class SonioxWorkflow:
-    """Workflow for the Soniox ``stt-rt-v5`` realtime model.
+class OpenAITranscriptionWorkflow(OpenAIWorkflow):
+    """Pro tier: OpenAI ``gpt-live-transcribe`` transcription only.
 
-    Audio travels as base64 text frames (accepted by Soniox as audio
-    content); translation targets are fixed at connect time, so runtime
-    language switches only flip which tokens the relay emits and need
-    no upstream send (``None`` payloads below).
+    Always opens the transcription endpoint; translation (if any) is
+    the relay's text-to-text subtitle step over the transcripts.
+    """
+
+    tier = MODEL_TIER_PRO
+
+    def create_upstream_client(self, settings: Any) -> OpenAIRealtimeClient:
+        return OpenAIRealtimeClient(
+            api_key=settings.openai_api_key,
+            model=settings.openai_transcription_model,
+            url=settings.openai_transcription_url,
+            beta_header=settings.openai_beta_header,
+            connect_timeout=settings.upstream_connect_timeout_seconds,
+            target_language=settings.translation_target_language,
+            transcription_model=settings.translation_transcription_model,
+            is_transcription=True,
+            transcription_languages=[],
+        )
+
+
+class SonioxWorkflow:
+    """Soniox ``stt-rt-v5`` workflow: transcription only.
+
+    The former Soniox one-way translation workflow is removed: the
+    session config never carries a ``translation`` block and only
+    original (source-language) final tokens map downstream. Audio
+    travels as base64 text frames; language switches need no upstream
+    send (``None`` payloads below) because transcription has no target.
     """
 
     name = PROVIDER_SONIOX
+    tier = MODEL_TIER_BASE
 
     def create_upstream_client(self, settings: Any) -> SonioxRealtimeClient:
         return SonioxRealtimeClient(
@@ -131,7 +169,7 @@ class SonioxWorkflow:
             num_channels=settings.soniox_num_channels,
             enable_endpoint_detection=settings.soniox_enable_endpoint_detection,
             connect_timeout=settings.upstream_connect_timeout_seconds,
-            is_transcription=settings.starts_in_transcription(),
+            is_transcription=True,
         )
 
     def to_upstream_payload(
@@ -140,8 +178,6 @@ class SonioxWorkflow:
         del transcription_mode  # Soniox audio frames are mode-independent.
         if isinstance(event, (AudioAppendEvent, UpstreamAudioAppendEvent)):
             return event.audio
-        # Soniox has no commit lifecycle; the stream ends with an empty
-        # text frame sent by the client close path instead.
         return None
 
     def webrtc_audio_payload(
@@ -157,10 +193,8 @@ class SonioxWorkflow:
 
     def map_upstream_event(
         self, event: dict[str, Any], transcription_mode: bool = False
-    ):  # -> BaseModel | None
+    ):
         if event.get("type") == "error" and "tokens" not in event:
-            # OpenAI-shaped error (defensive; Soniox sends token
-            # responses). Never fall through to the token mapper.
             raise UpstreamError.from_event(event)
         return map_soniox_event(event, transcription_mode)
 
@@ -168,7 +202,6 @@ class SonioxWorkflow:
         self, target_language: str, settings: Any
     ) -> str | None:
         del target_language, settings
-        # Fixed at connect; the relay flips its local emission filter.
         return None
 
     def build_transcription_update(
@@ -178,21 +211,34 @@ class SonioxWorkflow:
         return None
 
 
+# The base tier is the Soniox transcription workflow.
+SonioxTranscriptionWorkflow = SonioxWorkflow
+
+
 class STTWorkflowFactory:
-    """Drops in the workflow for the configured ``STT_PROVIDER``."""
+    """Drops in the transcription workflow for a tier or legacy config."""
 
     @staticmethod
-    def get_workflow(settings: Any) -> OpenAIWorkflow | SonioxWorkflow:
+    def get_workflow(
+        settings: Any, model_tier: str | None = None
+    ) -> OpenAIWorkflow | SonioxWorkflow:
+        tier = normalize_model_tier(model_tier)
+        if tier == MODEL_TIER_BASE:
+            return SonioxWorkflow()
+        if tier == MODEL_TIER_PRO:
+            return OpenAITranscriptionWorkflow()
         if getattr(settings, "stt_provider", PROVIDER_OPENAI) == PROVIDER_SONIOX:
             return SonioxWorkflow()
         return OpenAIWorkflow()
 
     @staticmethod
-    def provider_name(settings: Any) -> str:
-        return STTWorkflowFactory.get_workflow(settings).name
+    def provider_name(settings: Any, model_tier: str | None = None) -> str:
+        return STTWorkflowFactory.get_workflow(settings, model_tier).name
 
     @staticmethod
-    def create_upstream_client(settings: Any) -> Any:
-        return STTWorkflowFactory.get_workflow(settings).create_upstream_client(
-            settings
-        )
+    def create_upstream_client(
+        settings: Any, model_tier: str | None = None
+    ) -> Any:
+        return STTWorkflowFactory.get_workflow(
+            settings, model_tier
+        ).create_upstream_client(settings)
